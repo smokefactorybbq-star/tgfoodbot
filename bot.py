@@ -41,13 +41,11 @@ def run_fake_server(port: int = 8080):
 def schedule_restart():
     def _restart():
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    # создаём таймер без daemon-параметра
     timer = threading.Timer(RESTART_MINUTES * 60, _restart)
-    # включаем режим daemon уже на объекте
     timer.daemon = True
     timer.start()
 
-# === /start ===
+# === Хендлер на /start ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -62,7 +60,7 @@ async def cmd_start(message: types.Message):
     )
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
 
-# === Web App Data ===
+# === Хендлер Web App Data ===
 @dp.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_order(message: types.Message):
     logger.info("===== ПОЛУЧЕН ЗАКАЗ ОТ WEB APP =====")
@@ -71,7 +69,7 @@ async def handle_order(message: types.Message):
 
     try:
         data = json.loads(raw)
-        # Поля
+        # Собираем поля заказа
         pay_method = data.get('payMethod', 'не выбран')
         user       = message.from_user
         username   = f"@{user.username}" if user.username else user.full_name or "Без имени"
@@ -94,7 +92,7 @@ async def handle_order(message: types.Message):
             except:
                 when_str = f"{data['orderDate']} {data['orderTime']}"
 
-        # Состав
+        # Формируем состав заказа
         lines = []
         order_items = []
         for name, info in items.items():
@@ -104,7 +102,7 @@ async def handle_order(message: types.Message):
             order_items.append({"name": name, "qty": qty, "price": price})
         items_text = "\n".join(lines)
 
-        # Админ
+        # Сообщение админу
         admin_text = (
             "✅ <b>Новый заказ</b>\n"
             f"• <i>Пользователь:</i> {username}\n"
@@ -119,7 +117,7 @@ async def handle_order(message: types.Message):
         await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
         logger.info("Заказ отправлен админу")
 
-        # Клиент
+        # Сообщение клиенту
         client_text = (
             "📦 Ваш заказ принят!\n\n"
             f"Имя: {username}\nТелефон: {phone}\nАдрес: {address}\n"
@@ -127,10 +125,10 @@ async def handle_order(message: types.Message):
         )
         if when_str:
             client_text += f"Время: {when_str}\n"
-        client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся с вами для подтверждения!"
+        client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся!"
         await message.answer(client_text)
 
-        # Печать
+        # Отправка на печать
         payload = {
             "name":       username,
             "phone":      phone,
@@ -156,10 +154,14 @@ async def handle_order(message: types.Message):
 # === Запуск ===
 async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
+    # Снятие webhook перед polling
+    await bot.delete_webhook(drop_pending_updates=True)
+
     run_fake_server(8080)
     schedule_restart()
     await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
