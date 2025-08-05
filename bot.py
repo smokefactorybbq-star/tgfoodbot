@@ -127,7 +127,7 @@ async def handle_order(message: types.Message):
         )
         if when_str:
             client_text += f"Время: {when_str}\n"
-        client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся!"
+        client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся с вами для подтверждения!"
         await message.answer(client_text)
 
         # Печать
