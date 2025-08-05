@@ -16,7 +16,7 @@ import aiohttp
 # === Настройки ===
 API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_REMOVED")
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
-RESTART_MINUTES = 120
+RESTART_MINUTES = 420
 
 # === Логирование ===
 logging.basicConfig(
