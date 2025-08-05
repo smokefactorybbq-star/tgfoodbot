@@ -41,7 +41,11 @@ def run_fake_server(port: int = 8080):
 def schedule_restart():
     def _restart():
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    threading.Timer(RESTART_MINUTES * 60, _restart, daemon=True).start()
+    # создаём таймер без daemon-параметра
+    timer = threading.Timer(RESTART_MINUTES * 60, _restart)
+    # включаем режим daemon уже на объекте
+    timer.daemon = True
+    timer.start()
 
 # === /start ===
 @dp.message(Command("start"))
