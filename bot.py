@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 # === Настройки ===
-API_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "7557856598:AAFcJkyfj21_dYN_C9-_978G7rGhVZOfo6M")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
+API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "7557856598:AAFcJkyfj21_dYN_C9-_978G7rGhVZOfo6M")
+ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
 RESTART_MINUTES = 120
 
 # === Логирование ===
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # === Инициализация бота и диспетчера ===
 bot = Bot(token=API_TOKEN)
-dp  = Dispatcher(bot)
+dp  = Dispatcher()  # без аргументов!
 
 def run_fake_server(port: int = 8080):
     class Handler(BaseHTTPRequestHandler):
@@ -59,7 +59,7 @@ async def cmd_start(message: types.Message):
     )
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
 
-# === Хендлер данных из Web App ===
+# === Хендлер WebApp данных ===
 @dp.message.register(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_order(message: types.Message):
     logger.info("===== ПОЛУЧЕН ЗАКАЗ ОТ WEB APP =====")
@@ -70,22 +70,19 @@ async def handle_order(message: types.Message):
         data = json.loads(raw)
         # Собираем поля заказа
         pay_method = data.get('payMethod', 'не выбран')
-        user = message.from_user
-        username = f"@{user.username}" if user.username else user.full_name or "Без имени"
-        phone    = data.get('phone', 'не указан')
-        address  = data.get('address', 'не указан')
-        delivery = data.get('delivery', 0)
-        total    = data.get('total', 0)
-        items    = data.get('items', {})
+        user       = message.from_user
+        username   = f"@{user.username}" if user.username else user.full_name or "Без имени"
+        phone      = data.get('phone', 'не указан')
+        address    = data.get('address', 'не указан')
+        delivery   = data.get('delivery', 0)
+        total      = data.get('total', 0)
+        items      = data.get('items', {})
 
         # Время заказа
         when_str = ""
         if data.get("orderWhen") == "soonest":
             raw_date = data.get("orderDate")
-            if raw_date:
-                dt = datetime.strptime(raw_date, "%Y-%m-%d")
-            else:
-                dt = datetime.now(ZoneInfo("Asia/Bangkok"))
+            dt = datetime.strptime(raw_date, "%Y-%m-%d") if raw_date else datetime.now(ZoneInfo("Asia/Bangkok"))
             when_str = f"{dt.strftime('%d.%m')}, ближайшее"
         elif data.get("orderDate") and data.get("orderTime"):
             try:
@@ -133,16 +130,16 @@ async def handle_order(message: types.Message):
         client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся!"
         await bot.send_message(chat_id=message.chat.id, text=client_text)
 
-        # Отправка в чековую программу
+        # Отправка на печать
         payload = {
-            "name":      username,
-            "phone":     phone,
-            "address":   address,
-            "delivery":  delivery,
-            "payment":   pay_method,
-            "items":     order_items,
-            "total":     total,
-            "date":      datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S"),
+            "name":       username,
+            "phone":      phone,
+            "address":    address,
+            "delivery":   delivery,
+            "payment":    pay_method,
+            "items":      order_items,
+            "total":      total,
+            "date":       datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S"),
             "order_time": when_str
         }
         async with aiohttp.ClientSession() as sess:
@@ -152,7 +149,7 @@ async def handle_order(message: types.Message):
             else:
                 logger.error(f"Ошибка печати: HTTP {resp.status}")
 
-    except Exception as e:
+    except Exception:
         logger.exception("Ошибка при обработке заказа")
         await message.answer("⚠️ Произошла ошибка при оформлении заказа.")
 
@@ -161,9 +158,7 @@ async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
     run_fake_server(8080)
     schedule_restart()
-    await dp.start_polling()
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
