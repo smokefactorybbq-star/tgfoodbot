@@ -45,22 +45,24 @@ def schedule_restart():
     timer.daemon = True
     timer.start()
 
-# === Хендлер на /start ===
+# === /start ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     web_app_btn = types.KeyboardButton(
         text="📋 Открыть меню",
         web_app=types.WebAppInfo(url="https://v0-index-sepia.vercel.app")
     )
-    keyboard.add(web_app_btn)
+    keyboard = types.ReplyKeyboardMarkup(
+        keyboard=[[web_app_btn]],
+        resize_keyboard=True
+    )
     await message.answer(
         "Добро пожаловать в Smoke Factory BBQ!\nНажмите кнопку ниже, чтобы открыть меню.",
         reply_markup=keyboard
     )
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
 
-# === Хендлер Web App Data ===
+# === Web App Data ===
 @dp.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_order(message: types.Message):
     logger.info("===== ПОЛУЧЕН ЗАКАЗ ОТ WEB APP =====")
@@ -69,7 +71,6 @@ async def handle_order(message: types.Message):
 
     try:
         data = json.loads(raw)
-        # Собираем поля заказа
         pay_method = data.get('payMethod', 'не выбран')
         user       = message.from_user
         username   = f"@{user.username}" if user.username else user.full_name or "Без имени"
@@ -79,7 +80,6 @@ async def handle_order(message: types.Message):
         total      = data.get('total', 0)
         items      = data.get('items', {})
 
-        # Время заказа
         when_str = ""
         if data.get("orderWhen") == "soonest":
             raw_date = data.get("orderDate")
@@ -92,7 +92,6 @@ async def handle_order(message: types.Message):
             except:
                 when_str = f"{data['orderDate']} {data['orderTime']}"
 
-        # Формируем состав заказа
         lines = []
         order_items = []
         for name, info in items.items():
@@ -102,7 +101,6 @@ async def handle_order(message: types.Message):
             order_items.append({"name": name, "qty": qty, "price": price})
         items_text = "\n".join(lines)
 
-        # Сообщение админу
         admin_text = (
             "✅ <b>Новый заказ</b>\n"
             f"• <i>Пользователь:</i> {username}\n"
@@ -117,7 +115,6 @@ async def handle_order(message: types.Message):
         await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
         logger.info("Заказ отправлен админу")
 
-        # Сообщение клиенту
         client_text = (
             "📦 Ваш заказ принят!\n\n"
             f"Имя: {username}\nТелефон: {phone}\nАдрес: {address}\n"
@@ -128,7 +125,6 @@ async def handle_order(message: types.Message):
         client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся!"
         await message.answer(client_text)
 
-        # Отправка на печать
         payload = {
             "name":       username,
             "phone":      phone,
@@ -151,12 +147,9 @@ async def handle_order(message: types.Message):
         logger.exception("Ошибка обработки заказа")
         await message.answer("⚠️ Произошла ошибка при оформлении заказа.")
 
-# === Запуск ===
 async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
-    # Снятие webhook перед polling
     await bot.delete_webhook(drop_pending_updates=True)
-
     run_fake_server(8080)
     schedule_restart()
     await dp.start_polling(bot, skip_updates=True)
