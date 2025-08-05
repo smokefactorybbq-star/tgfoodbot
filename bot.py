@@ -4,8 +4,9 @@ import json
 import logging
 import asyncio
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from aiogram import Bot, Dispatcher, types
 from zoneinfo import ZoneInfo
 import aiohttp
@@ -23,7 +24,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# === Инициализация бота и диспетчера ===
+# === Инициализируем бота и диспетчер ===
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
@@ -42,13 +43,12 @@ def schedule_restart():
     def _restart():
         python = sys.executable
         os.execv(python, [python] + sys.argv)
-
     timer = threading.Timer(RESTART_MINUTES * 60, _restart)
     timer.daemon = True
     timer.start()
 
 # === Хендлеры ===
-@dp.message(commands=["start"])
+@dp.message.register(commands=["start"])
 async def cmd_start(message: types.Message):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     web_app_btn = types.KeyboardButton(
@@ -62,14 +62,14 @@ async def cmd_start(message: types.Message):
     )
     logger.info(f"Пользователь {message.from_user.id} начал работу с ботом.")
 
-@dp.message(content_types=types.ContentType.WEB_APP_DATA)
+@dp.message.register(content_types=types.ContentType.WEB_APP_DATA)
 async def handle_order(message: types.Message):
     logger.info("===== ПОЛУЧЕН ЗАКАЗ ОТ WEB APP =====")
     logger.info(f"Сырой data из WebApp: {message.web_app_data.data}")
 
     try:
         data = json.loads(message.web_app_data.data)
-        # Подготовка полей заказа
+        # Собираем данные заказа
         pay_method = data.get('payMethod', 'не выбран')
         user = message.from_user
         username = f"@{user.username}" if user.username else (user.full_name or "Без имени")
@@ -79,12 +79,12 @@ async def handle_order(message: types.Message):
         total = data.get('total', 0)
         items = data.get('items', {})
 
-        # Время заказа
+        # Определяем время заказа
         when_str = ""
         if data.get("orderWhen") == "soonest":
-            d = data.get('orderDate')
-            if d:
-                dt = datetime.strptime(d, "%Y-%m-%d")
+            raw = data.get('orderDate')
+            if raw:
+                dt = datetime.strptime(raw, "%Y-%m-%d")
             else:
                 dt = datetime.now(ZoneInfo("Asia/Bangkok"))
             when_str = f"{dt.strftime('%d.%m')}, ближайшее"
@@ -95,7 +95,7 @@ async def handle_order(message: types.Message):
             except:
                 when_str = f"{data['orderDate']} {data['orderTime']}"
 
-        # Состав заказа
+        # Формируем текст заказа
         item_lines = []
         order_items = []
         for name, info in items.items():
@@ -121,7 +121,7 @@ async def handle_order(message: types.Message):
         await bot.send_message(chat_id=ADMIN_CHAT_ID, text=admin_text, parse_mode="HTML")
         logger.info("Заказ успешно отправлен админу.")
 
-        # Сообщение клиенту
+        # Сообщение пользователю
         client_text = (
             "📦 Ваш заказ успешно принят!\n\n"
             f"Имя: {username}\n"
@@ -137,7 +137,7 @@ async def handle_order(message: types.Message):
 
         # Отправка на печать
         dt_bkk = datetime.now(ZoneInfo("Asia/Bangkok"))
-        payload = {
+        order_payload = {
             "name": username,
             "phone": phone,
             "address": address,
@@ -150,7 +150,7 @@ async def handle_order(message: types.Message):
         }
         try:
             async with aiohttp.ClientSession() as session:
-                resp = await session.post("https://9c7ad82f72b9.ngrok-free.app/order", json=payload)
+                resp = await session.post("https://9c7ad82f72b9.ngrok-free.app/order", json=order_payload)
                 if resp.status == 200:
                     logger.info("✅ Заказ отправлен в чековую программу.")
                 else:
@@ -158,11 +158,11 @@ async def handle_order(message: types.Message):
         except Exception:
             logger.exception("❌ Ошибка при подключении к чековой программе")
 
-    except Exception as e:
-        logger.exception(f"Ошибка при обработке заказа: {e}")
+    except Exception:
+        logger.exception("Ошибка при обработке заказа")
         await message.answer("⚠️ Произошла ошибка при оформлении заказа.")
 
-# === Основной запуск ===
+# === Запуск ===
 async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
     run_fake_server(port=8080)
@@ -171,4 +171,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
