@@ -137,7 +137,7 @@ async def handle_order(message: types.Message):
             "order_time": when_str
         }
         async with aiohttp.ClientSession() as sess:
-            resp = await sess.post("https://e67807ebd5cc.ngrok-free.app/order", json=payload)
+            resp = await sess.post("https://290c42f7da4e.ngrok-free.app/order", json=payload)
             if resp.status == 200:
                 logger.info("Печать отправлена")
             else:
