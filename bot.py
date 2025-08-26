@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 # === Настройки ===
-API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_REMOVED")
+API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_REMOVEDМ")
 ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
 RESTART_MINUTES = 420
 
@@ -80,6 +80,18 @@ async def handle_order(message: types.Message):
         total      = data.get('total', 0)
         items      = data.get('items', {})
 
+        # >>> ДОБАВЛЕНО: берём комментарий из любых полей и чистим ведущие ';'
+        comment = (
+            data.get("comment")
+            or data.get("comments")
+            or data.get("comment_text")
+            or data.get("note")
+            or data.get("notes")
+            or ""
+        )
+        comment = str(comment).strip().lstrip(";")
+        # <<< КОНЕЦ ДОБАВЛЕНОГО
+
         when_str = ""
         if data.get("orderWhen") == "soonest":
             raw_date = data.get("orderDate")
@@ -88,7 +100,7 @@ async def handle_order(message: types.Message):
         elif data.get("orderDate") and data.get("orderTime"):
             try:
                 dt = datetime.strptime(data["orderDate"], "%Y-%m-%d")
-                when_str = f"{dt.strftime('%d.%m')} в {data['orderTime']}"
+                when_str = f"{dt.strftime('%d.%м')} в {data['orderTime']}"
             except:
                 when_str = f"{data['orderDate']} {data['orderTime']}"
 
@@ -111,6 +123,11 @@ async def handle_order(message: types.Message):
         )
         if when_str:
             admin_text += f"• <i>Время заказа:</i> {when_str}\n"
+        # >>> ДОБАВЛЕНО: вставляем комментарий менеджеру отдельной строкой
+        if comment:
+            admin_text += f"• <i>Комментарий:</i> {comment}\n"
+        # <<< КОНЕЦ ДОБАВЛЕНОГО
+
         admin_text += f"\n🍽 <b>Состав заказа:</b>\n{items_text}\n\n💰 <b>Итого:</b> {total} ฿"
         await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
         logger.info("Заказ отправлен админу")
