@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 # === Настройки ===
-API_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_REMOVEDМ")
-ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
+API_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_REMOVED")
+ADMIN_CHAT_ID   = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
 RESTART_MINUTES = 420
 
 # === Логирование ===
@@ -80,7 +80,7 @@ async def handle_order(message: types.Message):
         total      = data.get('total', 0)
         items      = data.get('items', {})
 
-        # >>> ДОБАВЛЕНО: берём комментарий из любых полей и чистим ведущие ';'
+        # === КОММЕНТАРИЙ: берём из любых полей и чистим ведущие ';' ===
         comment = (
             data.get("comment")
             or data.get("comments")
@@ -90,7 +90,6 @@ async def handle_order(message: types.Message):
             or ""
         )
         comment = str(comment).strip().lstrip(";")
-        # <<< КОНЕЦ ДОБАВЛЕНОГО
 
         when_str = ""
         if data.get("orderWhen") == "soonest":
@@ -100,7 +99,7 @@ async def handle_order(message: types.Message):
         elif data.get("orderDate") and data.get("orderTime"):
             try:
                 dt = datetime.strptime(data["orderDate"], "%Y-%m-%d")
-                when_str = f"{dt.strftime('%d.%м')} в {data['orderTime']}"
+                when_str = f"{dt.strftime('%d.%m')} в {data['orderTime']}"
             except:
                 when_str = f"{data['orderDate']} {data['orderTime']}"
 
@@ -123,10 +122,9 @@ async def handle_order(message: types.Message):
         )
         if when_str:
             admin_text += f"• <i>Время заказа:</i> {when_str}\n"
-        # >>> ДОБАВЛЕНО: вставляем комментарий менеджеру отдельной строкой
+        # === КОММЕНТАРИЙ менеджеру отдельной строкой ===
         if comment:
             admin_text += f"• <i>Комментарий:</i> {comment}\n"
-        # <<< КОНЕЦ ДОБАВЛЕНОГО
 
         admin_text += f"\n🍽 <b>Состав заказа:</b>\n{items_text}\n\n💰 <b>Итого:</b> {total} ฿"
         await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
@@ -139,6 +137,8 @@ async def handle_order(message: types.Message):
         )
         if when_str:
             client_text += f"Время: {when_str}\n"
+        if comment:
+            client_text += f"Комментарий: {comment}\n"
         client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся с вами для подтверждения заказа!"
         await message.answer(client_text)
 
@@ -151,14 +151,21 @@ async def handle_order(message: types.Message):
             "items":      order_items,
             "total":      total,
             "date":       datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S"),
-            "order_time": when_str
+            "order_time": when_str,
+            # дублируем комментарий — на случай, если печать/сервер ждёт другое поле
+            "comment":       comment,
+            "comments":      comment,
+            "comment_text":  comment,
+            "note":          comment,
+            "notes":         comment,
         }
         async with aiohttp.ClientSession() as sess:
-            resp = await sess.post("https://290c42f7da4e.ngrok-free.app/order", json=payload)
-            if resp.status == 200:
-                logger.info("Печать отправлена")
-            else:
-                logger.error(f"Ошибка печати: HTTP {resp.status}")
+            async with sess.post("https://290c42f7da4e.ngrok-free.app/order", json=payload) as resp:
+                _ = await resp.text()  # читаем тело, чтобы аккуратно закрыть соединение
+                if resp.status == 200:
+                    logger.info("Печать отправлена")
+                else:
+                    logger.error(f"Ошибка печати: HTTP {resp.status}")
 
     except Exception:
         logger.exception("Ошибка обработки заказа")
@@ -166,7 +173,11 @@ async def handle_order(message: types.Message):
 
 async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
-    await bot.delete_webhook(drop_pending_updates=True)
+    # Если токен неправильный — delete_webhook может бросить NotFound.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.error(f"delete_webhook error: {e}")
     run_fake_server(8080)
     schedule_restart()
     await dp.start_polling(bot, skip_updates=True)
