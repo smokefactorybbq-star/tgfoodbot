@@ -14,9 +14,19 @@ from zoneinfo import ZoneInfo
 import aiohttp
 
 # === Настройки ===
-API_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "TOKEN_REMOVED")
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv (по желанию)
+    load_dotenv()
+except Exception:
+    pass
+
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not API_TOKEN:
+    logger.critical("ERROR: переменная окружения TELEGRAM_BOT_TOKEN не установлена")
+    sys.exit(1)
+
 ADMIN_CHAT_ID   = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
-RESTART_MINUTES = 420
+RESTART_MINUTES = int(os.getenv("RESTART_MINUTES", "420"))
 
 # === Логирование ===
 logging.basicConfig(
