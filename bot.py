@@ -170,7 +170,7 @@ async def handle_order(message: types.Message):
             "notes":         comment,
         }
         async with aiohttp.ClientSession() as sess:
-            async with sess.post("https://290c42f7da4e.ngrok-free.app/order", json=payload) as resp:
+            async with sess.post("https://9d00a442209a.ngrok-free.app/order", json=payload) as resp:
                 _ = await resp.text()  # читаем тело, чтобы аккуратно закрыть соединение
                 if resp.status == 200:
                     logger.info("Печать отправлена")
