@@ -67,7 +67,7 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True
     )
     await message.answer(
-        "Добро пожаловать в Smoke Factory BBQ!\nНажмите кнопку ниже, чтобы открыть меню.",
+        "\nНажмите кнопку ниже, чтобы открыть меню.",
         reply_markup=keyboard
     )
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
