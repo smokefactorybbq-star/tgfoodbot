@@ -115,42 +115,49 @@ async def handle_order(message: types.Message):
 
         lines = []
         order_items = []
-        for name, info in items.items():
-            qty   = info.get("qty", 0)
-            price = info.get("price", 0)
-            lines.append(f"- {name} ×{qty} = {qty*price} ฿")
-            order_items.append({"name": name, "qty": qty, "price": price})
-        items_text = "\n".join(lines)
+for name, info in items.items():
+    qty   = info.get("qty", 0)
+    price = info.get("price", 0)
+    lines.append(f"- {name} ×{qty} = {qty*price} ฿")
+    order_items.append({"name": name, "qty": qty, "price": price})
+items_text = "\n".join(lines)
 
-        admin_text = (
-            "✅ <b>Новый заказ</b>\n"
-            f"• <i>Пользователь:</i> {username}\n"
-            f"• <i>Телефон:</i> {phone}\n"
-            f"• <i>Адрес:</i> {address}\n"
-            f"• <i>Доставка:</i> {delivery} ฿\n"
-            f"• <i>Оплата:</i> {pay_method}\n"
-        )
-        if when_str:
-            admin_text += f"• <i>Время заказа:</i> {when_str}\n"
-        # === КОММЕНТАРИЙ менеджеру отдельной строкой ===
-        if comment:
-            admin_text += f"• <i>Комментарий:</i> {comment}\n"
+# безопасно берём текстовый адрес (если нет — ставим тире)
+addr_plain_text = (address_plain or "").strip() if 'address_plain' in locals() else "—"
+if not addr_plain_text:
+    addr_plain_text = "—"
 
-        admin_text += f"\n🍽 <b>Состав заказа:</b>\n{items_text}\n\n💰 <b>Итого:</b> {total} ฿"
-        await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
-        logger.info("Заказ отправлен админу")
+admin_text = (
+    "✅ <b>Новый заказ</b>\n"
+    f"• <i>Пользователь:</i> {username}\n"
+    f"• <i>Телефон:</i> {phone}\n"
+    f"• <i>Адрес (ссылка):</i> {address}\n"
+    f"• <i>Адрес (текст):</i> {addr_plain_text}\n"
+    f"• <i>Доставка:</i> {delivery} ฿\n"
+    f"• <i>Оплата:</i> {pay_method}\n"
+)
+if when_str:
+    admin_text += f"• <i>Время заказа:</i> {when_str}\n"
+# === КОММЕНТАРИЙ менеджеру отдельной строкой ===
+if comment:
+    admin_text += f"• <i>Комментарий:</i> {comment}\n"
 
-        client_text = (
-            "📦 Ваш заказ принят!\n\n"
-            f"Имя: {username}\nТелефон: {phone}\nАдрес: {address}\n"
-            f"Оплата: {pay_method}\nДоставка: {delivery} ฿\n"
-        )
-        if when_str:
-            client_text += f"Время: {when_str}\n"
-        if comment:
-            client_text += f"Комментарий: {comment}\n"
-        client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся с вами для подтверждения заказа!"
-        await message.answer(client_text)
+admin_text += f"\n🍽 <b>Состав заказа:</b>\n{items_text}\n\n💰 <b>Итого:</b> {total} ฿"
+await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
+logger.info("Заказ отправлен админу")
+
+client_text = (
+    "📦 Ваш заказ принят!\n\n"
+    f"Имя: {username}\nТелефон: {phone}\nАдрес: {address}\n"
+    f"Оплата: {pay_method}\nДоставка: {delivery} ฿\n"
+)
+if when_str:
+    client_text += f"Время: {when_str}\n"
+if comment:
+    client_text += f"Комментарий: {comment}\n"
+client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿\n\nМы скоро свяжемся с вами для подтверждения заказа!"
+await message.answer(client_text)
+
 
         payload = {
             "name":       username,
