@@ -38,7 +38,7 @@ ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
 RESTART_MINUTES  = int(os.getenv("RESTART_MINUTES", "420"))
 
 # ссылка на чат менеджера (личка: https://t.me/username, группа: invite link)
-MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")  # <- замени на реального менеджера
+MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
 
 WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://v0-index-sepia.vercel.app")
 
@@ -47,6 +47,10 @@ ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
 # === Инициализация бота и диспетчера ===
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher()
+
+# === Память: кому мы уже показывали клавиатуру (в рамках текущего запуска процесса) ===
+KEYBOARD_SHOWN_USERS = set()
+
 
 def run_fake_server(port: int = 8080):
     class Handler(BaseHTTPRequestHandler):
@@ -60,6 +64,7 @@ def run_fake_server(port: int = 8080):
         daemon=True
     ).start()
 
+
 def schedule_restart():
     def _restart():
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -67,6 +72,7 @@ def schedule_restart():
     timer = threading.Timer(RESTART_MINUTES * 60, _restart)
     timer.daemon = True
     timer.start()
+
 
 def start_keyboard() -> types.ReplyKeyboardMarkup:
     web_app_btn = types.KeyboardButton(
@@ -76,19 +82,36 @@ def start_keyboard() -> types.ReplyKeyboardMarkup:
     ask_btn = types.KeyboardButton(text=ASK_BTN_TEXT)
 
     return types.ReplyKeyboardMarkup(
-        keyboard=[[web_app_btn], [ask_btn]],  # <-- ВАЖНО: "задать вопрос" ниже
+        keyboard=[[web_app_btn], [ask_btn]],  # "задать вопрос" ниже
         resize_keyboard=True
     )
+
+
+async def send_main_keyboard(message: types.Message, text: str, force: bool = False):
+    """
+    Показываем клавиатуру только если:
+    - force=True (принудительно)
+    - или пользователю ещё не показывали клавиатуру в этом запуске.
+    """
+    uid = message.from_user.id
+    if (uid not in KEYBOARD_SHOWN_USERS) or force:
+        await message.answer(text, reply_markup=start_keyboard())
+        KEYBOARD_SHOWN_USERS.add(uid)
+        return True
+    return False
+
 
 # === /start ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer(
+    await send_main_keyboard(
+        message,
         "Нажмите кнопку ниже, чтобы открыть меню.\n"
         "Если есть вопросы — нажмите «💬 Задать вопрос менеджеру».",
-        reply_markup=start_keyboard()
+        force=True
     )
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
+
 
 # === Кнопка: Задать вопрос менеджеру -> ссылка в чат менеджера ===
 @dp.message(F.text == ASK_BTN_TEXT)
@@ -103,14 +126,16 @@ async def open_manager_chat(message: types.Message):
         reply_markup=kb.as_markup()
     )
 
+
 # === Назад в меню (inline) ===
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(call: types.CallbackQuery):
-    await call.message.answer(
-        "Ок. Возвращаю кнопки меню 👇",
-        reply_markup=start_keyboard()
-    )
+    # Показываем клавиатуру принудительно, чтобы точно появилась
+    msg = call.message
+    await msg.answer("Ок. Возвращаю кнопки меню 👇", reply_markup=start_keyboard())
+    KEYBOARD_SHOWN_USERS.add(call.from_user.id)
     await call.answer()
+
 
 # === Web App Data (ЗАКАЗЫ) ===
 @dp.message(F.content_type == ContentType.WEB_APP_DATA)
@@ -130,7 +155,6 @@ async def handle_order(message: types.Message):
         total      = data.get("total", 0)
         items      = data.get("items", {})
 
-        # === КОММЕНТАРИЙ: берём из любых полей и чистим ведущие ';' ===
         comment = (
             data.get("comment")
             or data.get("comments")
@@ -199,7 +223,9 @@ async def handle_order(message: types.Message):
             "Мы скоро свяжемся с вами для подтверждения заказа!"
         )
 
-        await message.answer(client_text)
+        # ✅ После заказа показываем клавиатуру принудительно
+        await message.answer(client_text, reply_markup=start_keyboard())
+        KEYBOARD_SHOWN_USERS.add(message.from_user.id)
 
         payload = {
             "name":       username,
@@ -211,8 +237,6 @@ async def handle_order(message: types.Message):
             "total":      total,
             "date":       datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S"),
             "order_time": when_str,
-
-            # дублируем комментарий — на случай, если печать/сервер ждёт другое поле
             "comment":      comment,
             "comments":     comment,
             "comment_text": comment,
@@ -230,7 +254,33 @@ async def handle_order(message: types.Message):
 
     except Exception:
         logger.exception("Ошибка обработки заказа")
-        await message.answer("⚠️ Произошла ошибка при оформлении заказа.")
+        # если ошибка — тоже покажем клавиатуру
+        await message.answer("⚠️ Произошла ошибка при оформлении заказа.", reply_markup=start_keyboard())
+        KEYBOARD_SHOWN_USERS.add(message.from_user.id)
+
+
+# === Показывать клавиатуру только если мы ещё не показывали её пользователю ===
+@dp.message()
+async def ensure_keyboard_if_missing(message: types.Message):
+    # Заказы уже обрабатывает handle_order
+    if message.content_type == ContentType.WEB_APP_DATA:
+        return
+
+    # Нажатие на ASK_BTN_TEXT уже обрабатывает open_manager_chat
+    if message.text == ASK_BTN_TEXT:
+        return
+
+    # Если пользователю ещё не показывали клавиатуру — покажем.
+    shown = await send_main_keyboard(
+        message,
+        "Выберите действие 👇",
+        force=False
+    )
+
+    # Если клавиатура уже была показана — НЕ отвечаем (чтобы не спамить)
+    if not shown:
+        return
+
 
 async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
@@ -244,8 +294,10 @@ async def main():
 
     await dp.start_polling(bot, skip_updates=True)
 
+
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
