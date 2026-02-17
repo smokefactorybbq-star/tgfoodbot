@@ -245,7 +245,7 @@ async def handle_order(message: types.Message):
         }
 
         async with aiohttp.ClientSession() as sess:
-            async with sess.post("https://29a4-171-6-238-175.ngrok-free.app/order", json=payload) as resp:
+            async with sess.post("https://3eee-171-6-239-140.ngrok-free.app/order", json=payload) as resp:
                 _ = await resp.text()
                 if resp.status == 200:
                     logger.info("Печать отправлена")
