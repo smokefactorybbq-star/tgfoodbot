@@ -15,7 +15,6 @@ from aiogram.enums import ContentType
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-
 # === Логирование (сначала!) ===
 logging.basicConfig(
     level=logging.INFO,
@@ -26,32 +25,46 @@ logger = logging.getLogger(__name__)
 
 # === Настройки ===
 try:
-    from dotenv import load_dotenv  # pip install python-dotenv (по желанию)
+    from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
 API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not API_TOKEN:
-    logger.critical("ERROR: переменная окружения TELEGRAM_BOT_TOKEN не установлена")
+    logger.critical("ERROR: TELEGRAM_BOT_TOKEN не установлен")
     sys.exit(1)
 
-ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
-RESTART_MINUTES  = int(os.getenv("RESTART_MINUTES", "420"))
+# ВАЖНО: если хочешь несколько менеджеров — можно указать ADMIN_CHAT_IDS="id1,id2"
+ADMIN_CHAT_ID  = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
+ADMIN_CHAT_IDS = os.getenv("ADMIN_CHAT_IDS", "").strip()
 
-MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
-WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://v0-index-sepia.vercel.app")
-ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
-PRINT_URL        = os.getenv("PRINT_URL", "https://1ea2-171-6-239-140.ngrok-free.app/order")
+RESTART_MINUTES = int(os.getenv("RESTART_MINUTES", "420"))
+MANAGER_URL     = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
+WEBAPP_URL      = os.getenv("WEBAPP_URL", "https://v0-index-sepia.vercel.app")
+ASK_BTN_TEXT    = "💬 Задать вопрос менеджеру"
+PRINT_URL       = os.getenv("PRINT_URL", "https://1ea2-171-6-239-140.ngrok-free.app/order")
 
-# === Инициализация ===
 bot = Bot(token=API_TOKEN)
-dp  = Dispatcher()
+dp = Dispatcher()
 
 KEYBOARD_SHOWN_USERS = set()
+waiting_reply = {}  # waiting_reply[admin_id] = {"client_id": int}
 
-# waiting_reply[admin_id] = {"client_id": int}
-waiting_reply = {}
+
+def get_admin_ids():
+    ids = []
+    if ADMIN_CHAT_IDS:
+        for p in ADMIN_CHAT_IDS.split(","):
+            p = p.strip()
+            if p:
+                try:
+                    ids.append(int(p))
+                except Exception:
+                    pass
+    if not ids:
+        ids = [ADMIN_CHAT_ID]
+    return ids
 
 
 def run_fake_server(port: int = 8080):
@@ -61,32 +74,21 @@ def run_fake_server(port: int = 8080):
             self.end_headers()
             self.wfile.write(b"OK")
 
-    threading.Thread(
-        target=HTTPServer(("", port), Handler).serve_forever,
-        daemon=True
-    ).start()
+    threading.Thread(target=HTTPServer(("", port), Handler).serve_forever, daemon=True).start()
 
 
 def schedule_restart():
     def _restart():
         os.execv(sys.executable, [sys.executable] + sys.argv)
-
     timer = threading.Timer(RESTART_MINUTES * 60, _restart)
     timer.daemon = True
     timer.start()
 
 
 def start_keyboard() -> types.ReplyKeyboardMarkup:
-    web_app_btn = types.KeyboardButton(
-        text="📋 Открыть меню",
-        web_app=types.WebAppInfo(url=WEBAPP_URL)
-    )
+    web_app_btn = types.KeyboardButton(text="📋 Открыть меню", web_app=types.WebAppInfo(url=WEBAPP_URL))
     ask_btn = types.KeyboardButton(text=ASK_BTN_TEXT)
-
-    return types.ReplyKeyboardMarkup(
-        keyboard=[[web_app_btn], [ask_btn]],
-        resize_keyboard=True
-    )
+    return types.ReplyKeyboardMarkup(keyboard=[[web_app_btn], [ask_btn]], resize_keyboard=True)
 
 
 async def send_main_keyboard(message: types.Message, text: str, force: bool = False):
@@ -114,7 +116,23 @@ def safe_str(x, default=""):
         return default
 
 
-# === Сервисные команды ===
+async def send_to_admin(text_html: str, reply_markup: types.InlineKeyboardMarkup | None = None) -> bool:
+    """
+    Пытаемся отправить всем admin ids.
+    ЛОГИРУЕМ точную причину, если не удалось.
+    """
+    ok_any = False
+    for admin_id in get_admin_ids():
+        try:
+            await bot.send_message(admin_id, text_html, parse_mode="HTML", reply_markup=reply_markup)
+            logger.info(f"ADMIN SEND OK -> {admin_id}")
+            ok_any = True
+        except Exception as e:
+            logger.exception(f"ADMIN SEND FAILED -> {admin_id}. Error: {e}")
+    return ok_any
+
+
+# === Диагностика ===
 @dp.message(Command("myid"))
 async def cmd_myid(message: types.Message):
     await message.answer(
@@ -122,18 +140,17 @@ async def cmd_myid(message: types.Message):
         parse_mode="HTML"
     )
 
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: types.Message):
-    if message.from_user.id != ADMIN_CHAT_ID:
-        return
-    if message.from_user.id in waiting_reply:
-        waiting_reply.pop(message.from_user.id, None)
-        await message.answer("✅ Отменено. Больше не жду текст.")
+
+@dp.message(Command("testadmin"))
+async def cmd_testadmin(message: types.Message):
+    test_text = f"✅ TEST: бот пытается отправить в ADMIN ids: {get_admin_ids()}"
+    ok = await send_to_admin(html.escape(test_text))
+    if ok:
+        await message.answer("✅ Тест ушёл админу(ам).")
     else:
-        await message.answer("Нет активного режима ответа.")
+        await message.answer("❌ Тест НЕ ушёл. Смотри лог (там будет точная ошибка: 403 / chat not found и т.д.).")
 
 
-# === /start ===
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await send_main_keyboard(
@@ -145,14 +162,12 @@ async def cmd_start(message: types.Message):
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
 
 
-# === Кнопка: Задать вопрос менеджеру -> ссылка ===
 @dp.message(F.text == ASK_BTN_TEXT)
 async def open_manager_chat(message: types.Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="👉 Открыть чат менеджера", url=MANAGER_URL)
     kb.button(text="⬅️ Назад в меню", callback_data="back_to_menu")
     kb.adjust(1)
-
     await message.answer("Открой чат менеджера по кнопке ниже 👇", reply_markup=kb.as_markup())
 
 
@@ -163,10 +178,28 @@ async def back_to_menu(call: types.CallbackQuery):
     await call.answer()
 
 
-# === Кнопка "Написать клиенту" ===
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: types.Message):
+    # отмена режима "жду текст"
+    if message.from_user.id in waiting_reply:
+        waiting_reply.pop(message.from_user.id, None)
+        await message.answer("✅ Отменено.")
+    else:
+        await message.answer("Нет активного режима ответа.")
+
+
+def build_admin_order_kb(client_id: int) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Открыть профиль клиента", url=f"tg://user?id={client_id}")
+    kb.button(text="✍️ Написать клиенту", callback_data=f"write_client:{client_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
 @dp.callback_query(F.data.startswith("write_client:"))
 async def cb_write_client(call: types.CallbackQuery):
-    if call.from_user.id != ADMIN_CHAT_ID:
+    # Разрешаем нажимать только тем, кто в admin ids
+    if call.from_user.id not in set(get_admin_ids()):
         await call.answer("Недостаточно прав", show_alert=True)
         return
 
@@ -181,12 +214,11 @@ async def cb_write_client(call: types.CallbackQuery):
     await call.answer("Жду текст")
 
 
-# === Менеджер вводит текст -> отправка клиенту ===
-@dp.message(F.from_user.id == ADMIN_CHAT_ID)
+@dp.message()
 async def admin_text_router(message: types.Message):
+    # если админ в режиме ожидания текста
     if message.from_user.id in waiting_reply and message.text and not message.text.startswith("/"):
-        info = waiting_reply.pop(message.from_user.id)
-        client_id = info["client_id"]
+        client_id = waiting_reply.pop(message.from_user.id)["client_id"]
         try:
             await bot.send_message(client_id, f"💬 Сообщение от менеджера:\n\n{message.text}")
             await message.answer("✅ Отправлено клиенту.")
@@ -195,13 +227,12 @@ async def admin_text_router(message: types.Message):
             await message.answer("⚠️ Не получилось отправить (клиент мог заблокировать бота).")
         return
 
-
-def build_admin_order_kb(client_id: int) -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="👤 Открыть профиль клиента", url=f"tg://user?id={client_id}")
-    kb.button(text="✍️ Написать клиенту", callback_data=f"write_client:{client_id}")
-    kb.adjust(1)
-    return kb.as_markup()
+    # иначе — обычная логика показа клавиатуры ниже
+    if message.content_type == ContentType.WEB_APP_DATA:
+        return
+    if message.text == ASK_BTN_TEXT:
+        return
+    await send_main_keyboard(message, "Выберите действие 👇", force=False)
 
 
 # === WebApp Data (ЗАКАЗЫ) ===
@@ -211,16 +242,13 @@ async def handle_order(message: types.Message):
     raw = message.web_app_data.data
     logger.info(f"RAW: {raw}")
 
-    # 1) JSON parse (отдельно!)
     try:
         data = json.loads(raw)
     except Exception:
         logger.exception("JSON parse error")
-        await message.answer("⚠️ Ошибка данных заказа. Попробуйте ещё раз.", reply_markup=start_keyboard())
-        KEYBOARD_SHOWN_USERS.add(message.from_user.id)
+        await message.answer("⚠️ Ошибка данных заказа.", reply_markup=start_keyboard())
         return
 
-    # 2) Safe extract
     user = message.from_user
     client_id = user.id
 
@@ -246,15 +274,11 @@ async def handle_order(message: types.Message):
     )
     comment = safe_str(comment, "").strip().lstrip(";")
 
-    # 3) When string (не должно валить заказ)
     when_str = ""
     try:
         if data.get("orderWhen") == "soonest":
             raw_date = data.get("orderDate")
-            if raw_date:
-                dt = datetime.strptime(str(raw_date), "%Y-%m-%d")
-            else:
-                dt = datetime.now(ZoneInfo("Asia/Bangkok"))
+            dt = datetime.strptime(str(raw_date), "%Y-%m-%d") if raw_date else datetime.now(ZoneInfo("Asia/Bangkok"))
             when_str = f"{dt.strftime('%d.%m')}, ближайшее"
         elif data.get("orderDate") and data.get("orderTime"):
             dt = datetime.strptime(str(data["orderDate"]), "%Y-%m-%d")
@@ -263,23 +287,18 @@ async def handle_order(message: types.Message):
         logger.exception("when_str parse error")
         when_str = ""
 
-    # 4) Items build (не должно валить заказ)
     lines = []
     order_items = []
-    try:
-        for name, info in items.items():
-            if not isinstance(info, dict):
-                continue
-            qty = safe_int(info.get("qty", 0), 0)
-            price = safe_int(info.get("price", 0), 0)
-            lines.append(f"- {name} ×{qty} = {qty * price} ฿")
-            order_items.append({"name": safe_str(name, ""), "qty": qty, "price": price})
-    except Exception:
-        logger.exception("items build error")
-
+    for name, info in items.items():
+        if not isinstance(info, dict):
+            continue
+        qty = safe_int(info.get("qty", 0), 0)
+        price = safe_int(info.get("price", 0), 0)
+        lines.append(f"- {name} ×{qty} = {qty * price} ฿")
+        order_items.append({"name": safe_str(name, ""), "qty": qty, "price": price})
     items_text = "\n".join(lines) if lines else "—"
 
-    # 5) Клиенту подтверждение — всегда!
+    # Клиенту подтверждение (всегда)
     client_text = (
         "📦 Ваш заказ принят!\n\n"
         f"Имя: {username}\n"
@@ -292,51 +311,29 @@ async def handle_order(message: types.Message):
         client_text += f"Время: {when_str}\n"
     if comment:
         client_text += f"Комментарий: {comment}\n"
+    client_text += f"\n🧾 Состав заказа:\n{items_text}\n\n💰 Итого: {total} ฿"
+    await message.answer(client_text, reply_markup=start_keyboard())
+    KEYBOARD_SHOWN_USERS.add(client_id)
 
-    client_text += (
-        f"\n🧾 Состав заказа:\n{items_text}\n\n"
-        f"💰 Итого: {total} ฿\n\n"
-        "Мы скоро свяжемся с вами для подтверждения заказа!"
+    # Админу (экранируем HTML!)
+    admin_text = (
+        "✅ <b>Новый заказ</b>\n"
+        f"• <i>Пользователь:</i> {html.escape(username)}\n"
+        f"• <i>User ID:</i> <code>{client_id}</code>\n"
+        f"• <i>Телефон:</i> {html.escape(phone)}\n"
+        f"• <i>Адрес:</i> {html.escape(address)}\n"
+        f"• <i>Доставка:</i> {delivery} ฿\n"
+        f"• <i>Оплата:</i> {html.escape(pay_method)}\n"
     )
+    if when_str:
+        admin_text += f"• <i>Время заказа:</i> {html.escape(when_str)}\n"
+    if comment:
+        admin_text += f"• <i>Комментарий:</i> {html.escape(comment)}\n"
+    admin_text += f"\n🍽 <b>Состав заказа:</b>\n{html.escape(items_text)}\n\n💰 <b>Итого:</b> {total} ฿"
 
-    try:
-        await message.answer(client_text, reply_markup=start_keyboard())
-        KEYBOARD_SHOWN_USERS.add(client_id)
-    except Exception:
-        logger.exception("Failed to send client confirmation")
+    await send_to_admin(admin_text, reply_markup=build_admin_order_kb(client_id))
 
-    # 6) Админу сообщение (HTML ЭКРАНИРУЕМ!)
-    try:
-        admin_text = (
-            "✅ <b>Новый заказ</b>\n"
-            f"• <i>Пользователь:</i> {html.escape(username)}\n"
-            f"• <i>User ID:</i> <code>{client_id}</code>\n"
-            f"• <i>Телефон:</i> {html.escape(phone)}\n"
-            f"• <i>Адрес:</i> {html.escape(address)}\n"
-            f"• <i>Доставка:</i> {delivery} ฿\n"
-            f"• <i>Оплата:</i> {html.escape(pay_method)}\n"
-        )
-        if when_str:
-            admin_text += f"• <i>Время заказа:</i> {html.escape(when_str)}\n"
-        if comment:
-            admin_text += f"• <i>Комментарий:</i> {html.escape(comment)}\n"
-
-        admin_text += (
-            f"\n🍽 <b>Состав заказа:</b>\n{html.escape(items_text)}\n\n"
-            f"💰 <b>Итого:</b> {total} ฿"
-        )
-
-        await bot.send_message(
-            ADMIN_CHAT_ID,
-            admin_text,
-            parse_mode="HTML",
-            reply_markup=build_admin_order_kb(client_id)
-        )
-        logger.info("Заказ отправлен админу + кнопки")
-    except Exception as e:
-        logger.exception(f"ADMIN SEND FAILED: {e}")
-
-    # 7) Печать — отдельно (чтобы никогда не ломать заказ)
+    # Печать — отдельно
     payload = {
         "name": username,
         "phone": phone,
@@ -353,35 +350,23 @@ async def handle_order(message: types.Message):
         "note": comment,
         "notes": comment,
     }
-
     try:
         timeout = aiohttp.ClientTimeout(total=7)
         async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(PRINT_URL, json=payload) as resp:
-                _ = await resp.text()
+                body = await resp.text()
                 if resp.status == 200:
                     logger.info("Печать отправлена")
                 else:
-                    logger.error(f"Ошибка печати: HTTP {resp.status}")
+                    logger.error(f"Ошибка печати: HTTP {resp.status}, body={body[:200]}")
     except Exception:
         logger.exception("Print send error")
 
 
-# === Показывать клавиатуру только если мы ещё не показывали её пользователю ===
-@dp.message()
-async def ensure_keyboard_if_missing(message: types.Message):
-    if message.content_type == ContentType.WEB_APP_DATA:
-        return
-    if message.text == ASK_BTN_TEXT:
-        return
-
-    shown = await send_main_keyboard(message, "Выберите действие 👇", force=False)
-    if not shown:
-        return
-
-
 async def main():
     logger.info("=== Запуск бота Smoke Factory BBQ ===")
+    logger.info(f"ADMIN ids = {get_admin_ids()}")
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
@@ -389,7 +374,6 @@ async def main():
 
     run_fake_server(8080)
     schedule_restart()
-
     await dp.start_polling(bot, skip_updates=True)
 
 
