@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 import threading
+import html
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
@@ -13,6 +14,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ContentType
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 # === Логирование (сначала!) ===
 logging.basicConfig(
@@ -37,23 +39,17 @@ if not API_TOKEN:
 ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
 RESTART_MINUTES  = int(os.getenv("RESTART_MINUTES", "420"))
 
-# ссылка на чат менеджера (личка: https://t.me/username, группа: invite link)
 MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
-
 WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://v0-index-sepia.vercel.app")
-
 ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
-
 PRINT_URL        = os.getenv("PRINT_URL", "https://1ea2-171-6-239-140.ngrok-free.app/order")
 
-# === Инициализация бота и диспетчера ===
+# === Инициализация ===
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher()
 
-# === Память: кому мы уже показывали клавиатуру (в рамках текущего запуска процесса) ===
 KEYBOARD_SHOWN_USERS = set()
 
-# === Память: режим "жду текст от менеджера для клиента" ===
 # waiting_reply[admin_id] = {"client_id": int}
 waiting_reply = {}
 
@@ -94,17 +90,28 @@ def start_keyboard() -> types.ReplyKeyboardMarkup:
 
 
 async def send_main_keyboard(message: types.Message, text: str, force: bool = False):
-    """
-    Показываем клавиатуру только если:
-    - force=True (принудительно)
-    - или пользователю ещё не показывали клавиатуру в этом запуске.
-    """
     uid = message.from_user.id
     if (uid not in KEYBOARD_SHOWN_USERS) or force:
         await message.answer(text, reply_markup=start_keyboard())
         KEYBOARD_SHOWN_USERS.add(uid)
         return True
     return False
+
+
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def safe_str(x, default=""):
+    try:
+        if x is None:
+            return default
+        return str(x)
+    except Exception:
+        return default
 
 
 # === Сервисные команды ===
@@ -138,7 +145,7 @@ async def cmd_start(message: types.Message):
     logger.info(f"Пользователь {message.from_user.id} нажал /start")
 
 
-# === Кнопка: Задать вопрос менеджеру -> ссылка в чат менеджера ===
+# === Кнопка: Задать вопрос менеджеру -> ссылка ===
 @dp.message(F.text == ASK_BTN_TEXT)
 async def open_manager_chat(message: types.Message):
     kb = InlineKeyboardBuilder()
@@ -146,25 +153,19 @@ async def open_manager_chat(message: types.Message):
     kb.button(text="⬅️ Назад в меню", callback_data="back_to_menu")
     kb.adjust(1)
 
-    await message.answer(
-        "Открой чат менеджера по кнопке ниже 👇",
-        reply_markup=kb.as_markup()
-    )
+    await message.answer("Открой чат менеджера по кнопке ниже 👇", reply_markup=kb.as_markup())
 
 
-# === Назад в меню (inline) ===
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(call: types.CallbackQuery):
-    msg = call.message
-    await msg.answer("Ок. Возвращаю кнопки меню 👇", reply_markup=start_keyboard())
+    await call.message.answer("Ок. Возвращаю кнопки меню 👇", reply_markup=start_keyboard())
     KEYBOARD_SHOWN_USERS.add(call.from_user.id)
     await call.answer()
 
 
-# === Кнопка под заказом у менеджера: "Написать клиенту" ===
+# === Кнопка "Написать клиенту" ===
 @dp.callback_query(F.data.startswith("write_client:"))
 async def cb_write_client(call: types.CallbackQuery):
-    # чтобы никто кроме админа не мог нажать
     if call.from_user.id != ADMIN_CHAT_ID:
         await call.answer("Недостаточно прав", show_alert=True)
         return
@@ -176,181 +177,194 @@ async def cb_write_client(call: types.CallbackQuery):
         return
 
     waiting_reply[call.from_user.id] = {"client_id": client_id}
-
-    await call.message.answer(
-        "✍️ Напишите текст, который нужно отправить клиенту.\n"
-        "Отмена: /cancel"
-    )
-    await call.answer("Ок, жду текст")
+    await call.message.answer("✍️ Напишите текст клиенту.\nОтмена: /cancel")
+    await call.answer("Жду текст")
 
 
-# === Менеджер вводит текст — бот пересылает клиенту ===
+# === Менеджер вводит текст -> отправка клиенту ===
 @dp.message(F.from_user.id == ADMIN_CHAT_ID)
 async def admin_text_router(message: types.Message):
     if message.from_user.id in waiting_reply and message.text and not message.text.startswith("/"):
         info = waiting_reply.pop(message.from_user.id)
         client_id = info["client_id"]
-
         try:
-            await bot.send_message(
-                chat_id=client_id,
-                text=f"💬 Сообщение от менеджера:\n\n{message.text}"
-            )
-            await message.answer("✅ Сообщение отправлено клиенту.")
+            await bot.send_message(client_id, f"💬 Сообщение от менеджера:\n\n{message.text}")
+            await message.answer("✅ Отправлено клиенту.")
         except Exception as e:
             logger.exception(f"Не удалось отправить клиенту {client_id}: {e}")
-            await message.answer(
-                "⚠️ Не получилось отправить клиенту.\n"
-                "Обычно причины: клиент заблокировал бота или не нажимал /start."
-            )
+            await message.answer("⚠️ Не получилось отправить (клиент мог заблокировать бота).")
         return
 
 
 def build_admin_order_kb(client_id: int) -> types.InlineKeyboardMarkup:
-    """
-    Две кнопки:
-    1) Открыть профиль/чат клиента (tg://user?id=...)
-    2) Написать клиенту через бота (ввод текста -> отправка клиенту)
-    """
     kb = InlineKeyboardBuilder()
-
-    # Открыть профиль/чат клиента (может работать не везде, но часто работает)
     kb.button(text="👤 Открыть профиль клиента", url=f"tg://user?id={client_id}")
-
-    # Написать через бота
     kb.button(text="✍️ Написать клиенту", callback_data=f"write_client:{client_id}")
-
     kb.adjust(1)
     return kb.as_markup()
 
 
-# === Web App Data (ЗАКАЗЫ) ===
+# === WebApp Data (ЗАКАЗЫ) ===
 @dp.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_order(message: types.Message):
     logger.info("===== ПОЛУЧЕН ЗАКАЗ ОТ WEB APP =====")
     raw = message.web_app_data.data
-    logger.info(f"Сырой data: {raw}")
+    logger.info(f"RAW: {raw}")
 
+    # 1) JSON parse (отдельно!)
     try:
         data = json.loads(raw)
-        pay_method = data.get("payMethod", "не выбран")
-        user       = message.from_user
-        client_id  = user.id
+    except Exception:
+        logger.exception("JSON parse error")
+        await message.answer("⚠️ Ошибка данных заказа. Попробуйте ещё раз.", reply_markup=start_keyboard())
+        KEYBOARD_SHOWN_USERS.add(message.from_user.id)
+        return
 
-        username   = f"@{user.username}" if user.username else (user.full_name or "Без имени")
-        phone      = data.get("phone", "не указан")
-        address    = data.get("address", "не указан")
-        delivery   = data.get("delivery", 0)
-        total      = data.get("total", 0)
-        items      = data.get("items", {})
+    # 2) Safe extract
+    user = message.from_user
+    client_id = user.id
 
-        comment = (
-            data.get("comment")
-            or data.get("comments")
-            or data.get("comment_text")
-            or data.get("note")
-            or data.get("notes")
-            or ""
-        )
-        comment = str(comment).strip().lstrip(";")
+    pay_method = safe_str(data.get("payMethod", "не выбран"), "не выбран")
+    username = f"@{user.username}" if user.username else (user.full_name or "Без имени")
 
-        when_str = ""
+    phone = safe_str(data.get("phone", "не указан"), "не указан")
+    address = safe_str(data.get("address", "не указан"), "не указан")
+    delivery = safe_int(data.get("delivery", 0), 0)
+    total = safe_int(data.get("total", 0), 0)
+
+    items = data.get("items") or {}
+    if not isinstance(items, dict):
+        items = {}
+
+    comment = (
+        data.get("comment")
+        or data.get("comments")
+        or data.get("comment_text")
+        or data.get("note")
+        or data.get("notes")
+        or ""
+    )
+    comment = safe_str(comment, "").strip().lstrip(";")
+
+    # 3) When string (не должно валить заказ)
+    when_str = ""
+    try:
         if data.get("orderWhen") == "soonest":
             raw_date = data.get("orderDate")
-            dt = datetime.strptime(raw_date, "%Y-%m-%d") if raw_date else datetime.now(ZoneInfo("Asia/Bangkok"))
+            if raw_date:
+                dt = datetime.strptime(str(raw_date), "%Y-%m-%d")
+            else:
+                dt = datetime.now(ZoneInfo("Asia/Bangkok"))
             when_str = f"{dt.strftime('%d.%m')}, ближайшее"
         elif data.get("orderDate") and data.get("orderTime"):
-            try:
-                dt = datetime.strptime(data["orderDate"], "%Y-%m-%d")
-                when_str = f"{dt.strftime('%d.%m')} в {data['orderTime']}"
-            except Exception:
-                when_str = f"{data.get('orderDate')} {data.get('orderTime')}"
+            dt = datetime.strptime(str(data["orderDate"]), "%Y-%m-%d")
+            when_str = f"{dt.strftime('%d.%m')} в {data['orderTime']}"
+    except Exception:
+        logger.exception("when_str parse error")
+        when_str = ""
 
-        lines = []
-        order_items = []
+    # 4) Items build (не должно валить заказ)
+    lines = []
+    order_items = []
+    try:
         for name, info in items.items():
-            qty   = int(info.get("qty", 0) or 0)
-            price = int(info.get("price", 0) or 0)
+            if not isinstance(info, dict):
+                continue
+            qty = safe_int(info.get("qty", 0), 0)
+            price = safe_int(info.get("price", 0), 0)
             lines.append(f"- {name} ×{qty} = {qty * price} ฿")
-            order_items.append({"name": name, "qty": qty, "price": price})
-        items_text = "\n".join(lines) if lines else "—"
+            order_items.append({"name": safe_str(name, ""), "qty": qty, "price": price})
+    except Exception:
+        logger.exception("items build error")
 
+    items_text = "\n".join(lines) if lines else "—"
+
+    # 5) Клиенту подтверждение — всегда!
+    client_text = (
+        "📦 Ваш заказ принят!\n\n"
+        f"Имя: {username}\n"
+        f"Телефон: {phone}\n"
+        f"Адрес: {address}\n"
+        f"Оплата: {pay_method}\n"
+        f"Доставка: {delivery} ฿\n"
+    )
+    if when_str:
+        client_text += f"Время: {when_str}\n"
+    if comment:
+        client_text += f"Комментарий: {comment}\n"
+
+    client_text += (
+        f"\n🧾 Состав заказа:\n{items_text}\n\n"
+        f"💰 Итого: {total} ฿\n\n"
+        "Мы скоро свяжемся с вами для подтверждения заказа!"
+    )
+
+    try:
+        await message.answer(client_text, reply_markup=start_keyboard())
+        KEYBOARD_SHOWN_USERS.add(client_id)
+    except Exception:
+        logger.exception("Failed to send client confirmation")
+
+    # 6) Админу сообщение (HTML ЭКРАНИРУЕМ!)
+    try:
         admin_text = (
             "✅ <b>Новый заказ</b>\n"
-            f"• <i>Пользователь:</i> {username}\n"
+            f"• <i>Пользователь:</i> {html.escape(username)}\n"
             f"• <i>User ID:</i> <code>{client_id}</code>\n"
-            f"• <i>Телефон:</i> {phone}\n"
-            f"• <i>Адрес:</i> {address}\n"
+            f"• <i>Телефон:</i> {html.escape(phone)}\n"
+            f"• <i>Адрес:</i> {html.escape(address)}\n"
             f"• <i>Доставка:</i> {delivery} ฿\n"
-            f"• <i>Оплата:</i> {pay_method}\n"
+            f"• <i>Оплата:</i> {html.escape(pay_method)}\n"
         )
         if when_str:
-            admin_text += f"• <i>Время заказа:</i> {when_str}\n"
+            admin_text += f"• <i>Время заказа:</i> {html.escape(when_str)}\n"
         if comment:
-            admin_text += f"• <i>Комментарий:</i> {comment}\n"
+            admin_text += f"• <i>Комментарий:</i> {html.escape(comment)}\n"
 
-        admin_text += f"\n🍽 <b>Состав заказа:</b>\n{items_text}\n\n💰 <b>Итого:</b> {total} ฿"
+        admin_text += (
+            f"\n🍽 <b>Состав заказа:</b>\n{html.escape(items_text)}\n\n"
+            f"💰 <b>Итого:</b> {total} ฿"
+        )
 
-        # Отправляем админу + две кнопки
         await bot.send_message(
             ADMIN_CHAT_ID,
             admin_text,
             parse_mode="HTML",
             reply_markup=build_admin_order_kb(client_id)
         )
-        logger.info("Заказ отправлен админу + кнопки профиль/написать")
+        logger.info("Заказ отправлен админу + кнопки")
+    except Exception as e:
+        logger.exception(f"ADMIN SEND FAILED: {e}")
 
-        client_text = (
-            "📦 Ваш заказ принят!\n\n"
-            f"Имя: {username}\n"
-            f"Телефон: {phone}\n"
-            f"Адрес: {address}\n"
-            f"Оплата: {pay_method}\n"
-            f"Доставка: {delivery} ฿\n"
-        )
-        if when_str:
-            client_text += f"Время: {when_str}\n"
-        if comment:
-            client_text += f"Комментарий: {comment}\n"
+    # 7) Печать — отдельно (чтобы никогда не ломать заказ)
+    payload = {
+        "name": username,
+        "phone": phone,
+        "address": address,
+        "delivery": delivery,
+        "payment": pay_method,
+        "items": order_items,
+        "total": total,
+        "date": datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S"),
+        "order_time": when_str,
+        "comment": comment,
+        "comments": comment,
+        "comment_text": comment,
+        "note": comment,
+        "notes": comment,
+    }
 
-        client_text += (
-            f"\n🧾 Состав заказа:\n{items_text}\n\n"
-            f"💰 Итого: {total} ฿\n\n"
-            "Мы скоро свяжемся с вами для подтверждения заказа!"
-        )
-
-        await message.answer(client_text, reply_markup=start_keyboard())
-        KEYBOARD_SHOWN_USERS.add(client_id)
-
-        payload = {
-            "name":       username,
-            "phone":      phone,
-            "address":    address,
-            "delivery":   delivery,
-            "payment":    pay_method,
-            "items":      order_items,
-            "total":      total,
-            "date":       datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M:%S"),
-            "order_time": when_str,
-            "comment":      comment,
-            "comments":     comment,
-            "comment_text": comment,
-            "note":         comment,
-            "notes":        comment,
-        }
-
-        async with aiohttp.ClientSession() as sess:
+    try:
+        timeout = aiohttp.ClientTimeout(total=7)
+        async with aiohttp.ClientSession(timeout=timeout) as sess:
             async with sess.post(PRINT_URL, json=payload) as resp:
                 _ = await resp.text()
                 if resp.status == 200:
                     logger.info("Печать отправлена")
                 else:
                     logger.error(f"Ошибка печати: HTTP {resp.status}")
-
     except Exception:
-        logger.exception("Ошибка обработки заказа")
-        await message.answer("⚠️ Произошла ошибка при оформлении заказа.", reply_markup=start_keyboard())
-        KEYBOARD_SHOWN_USERS.add(message.from_user.id)
+        logger.exception("Print send error")
 
 
 # === Показывать клавиатуру только если мы ещё не показывали её пользователю ===
@@ -361,11 +375,7 @@ async def ensure_keyboard_if_missing(message: types.Message):
     if message.text == ASK_BTN_TEXT:
         return
 
-    shown = await send_main_keyboard(
-        message,
-        "Выберите действие 👇",
-        force=False
-    )
+    shown = await send_main_keyboard(message, "Выберите действие 👇", force=False)
     if not shown:
         return
 
