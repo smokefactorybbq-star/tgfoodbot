@@ -41,7 +41,7 @@ RESTART_MINUTES  = int(os.getenv("RESTART_MINUTES", "420"))
 MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
 WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://v0-index-sepia.vercel.app")
 ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
-PRINT_URL        = os.getenv("PRINT_URL", "https://2d49-171-6-241-21.ngrok-free.app/order")
+PRINT_URL        = os.getenv("PRINT_URL", "https://d9eb-171-6-236-160.ngrok-free.app/order")
 
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher()
