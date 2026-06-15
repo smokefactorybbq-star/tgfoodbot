@@ -40,6 +40,7 @@ RESTART_MINUTES  = int(os.getenv("RESTART_MINUTES", "420"))
 
 MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
 WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://holidaysenya-production.up.railway.app")
+MENU_BTN_TEXT    = "📋 Открыть меню"
 ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
 PRINT_URL        = os.getenv("PRINT_URL", "https://2b01-171-6-236-122.ngrok-free.app/order")
 
@@ -70,7 +71,23 @@ def schedule_restart():
 
 
 def start_keyboard() -> types.ReplyKeyboardMarkup:
-    web_app_btn = types.KeyboardButton(text="📋 Открыть меню", web_app=types.WebAppInfo(url=WEBAPP_URL))
+    """
+    Первая клавиатура: кнопка "Открыть меню" НЕ открывает сайт сразу.
+    Она отправляет текст боту, чтобы бот мог обновить клавиатуру пользователю.
+    """
+    menu_btn = types.KeyboardButton(text=MENU_BTN_TEXT)
+    ask_btn = types.KeyboardButton(text=ASK_BTN_TEXT)
+    return types.ReplyKeyboardMarkup(keyboard=[[menu_btn], [ask_btn]], resize_keyboard=True)
+
+
+def updated_keyboard() -> types.ReplyKeyboardMarkup:
+    """
+    Обновлённая клавиатура: кнопка "Открыть меню" уже открывает новый WebApp.
+    """
+    web_app_btn = types.KeyboardButton(
+        text=MENU_BTN_TEXT,
+        web_app=types.WebAppInfo(url=WEBAPP_URL)
+    )
     ask_btn = types.KeyboardButton(text=ASK_BTN_TEXT)
     return types.ReplyKeyboardMarkup(keyboard=[[web_app_btn], [ask_btn]], resize_keyboard=True)
 
@@ -158,6 +175,21 @@ async def cmd_start(message: types.Message):
         "Если есть вопросы — нажмите «💬 Задать вопрос менеджеру».",
         force=True
     )
+
+
+
+@dp.message(F.text == MENU_BTN_TEXT)
+async def refresh_menu_keyboard(message: types.Message):
+    """
+    Пользователь нажимает "Открыть меню" первый раз.
+    Бот обновляет клавиатуру. После этого пользователь нажимает "Открыть меню" ещё раз,
+    и уже открывается новый сайт из WEBAPP_URL.
+    """
+    await message.answer(
+        "✅ Меню обновлено. Нажмите «📋 Открыть меню» ещё раз.",
+        reply_markup=updated_keyboard()
+    )
+    KEYBOARD_SHOWN_USERS.add(message.from_user.id)
 
 
 @dp.message(Command("cancel"))
@@ -358,7 +390,7 @@ async def handle_order(message: types.Message):
 async def ensure_keyboard_if_missing(message: types.Message):
     if message.content_type == ContentType.WEB_APP_DATA:
         return
-    if message.text == ASK_BTN_TEXT:
+    if message.text in [ASK_BTN_TEXT, MENU_BTN_TEXT]:
         return
     await send_main_keyboard(message, "Выберите действие 👇", force=False)
 
