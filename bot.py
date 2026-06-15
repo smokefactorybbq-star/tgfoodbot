@@ -39,7 +39,7 @@ ADMIN_CHAT_ID    = int(os.getenv("ADMIN_CHAT_ID", "7309681026"))
 RESTART_MINUTES  = int(os.getenv("RESTART_MINUTES", "420"))
 
 MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
-WEBAPP_URL       = os.getenv("WEBAPP_URL", "holidaysenya-production.up.railway.app")
+WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://holidaysenya-production.up.railway.app")
 ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
 PRINT_URL        = os.getenv("PRINT_URL", "https://2b01-171-6-236-122.ngrok-free.app/order")
 
