@@ -42,7 +42,7 @@ MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
 WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://v0-index-sepia.vercel.app")
 MENU_BTN_TEXT    = "📋 Открыть меню"
 ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
-PRINT_URL        = os.getenv("PRINT_URL", "https://1ab9-171-6-242-133.ngrok-free.app/order")
+PRINT_URL        = os.getenv("PRINT_URL", "https://a322-171-6-240-125.ngrok-free.app/order")
 
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher()
