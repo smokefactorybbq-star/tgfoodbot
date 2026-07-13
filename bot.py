@@ -42,7 +42,7 @@ MANAGER_URL      = os.getenv("MANAGER_URL", "https://t.me/SmokefactoryBBQ")
 WEBAPP_URL       = os.getenv("WEBAPP_URL", "https://mini-app-production-67f2.up.railway.app")
 MENU_BTN_TEXT    = "📋 Открыть меню"
 ASK_BTN_TEXT     = "💬 Задать вопрос менеджеру"
-PRINT_URL        = os.getenv("PRINT_URL", "https://7159-171-6-241-142.ngrok-free.app/order")
+PRINT_URL        = os.getenv("PRINT_URL", "https://013a-171-6-241-142.ngrok-free.app/order")
 
 bot = Bot(token=API_TOKEN)
 dp  = Dispatcher()
