@@ -96,21 +96,20 @@ dp = Dispatcher()
 
 KEYBOARD_SHOWN_USERS: set[int] = set()
 
-# Режим ответа менеджера клиенту.
 waiting_reply: dict[int, dict[str, int]] = {}
-
-# Администратор ожидает рекламное сообщение.
 waiting_broadcast: set[int] = set()
-
-# Подготовленная, но ещё не запущенная рассылка.
 pending_broadcasts: dict[int, dict] = {}
 
-# Не позволяет запустить одновременно несколько рассылок.
+# Состояние команды /bonus.
+# Формат:
+# waiting_bonus[manager_id] = {
+#     "stage": "telegram_id" или "amount",
+#     "telegram_id": 123
+# }
+waiting_bonus: dict[int, dict] = {}
+
 broadcast_lock = asyncio.Lock()
 broadcast_running = False
-
-# Пауза между сообщениями.
-# Примерно 16 сообщений в секунду.
 BROADCAST_DELAY = 0.06
 
 db_pool: asyncpg.Pool | None = None
@@ -177,6 +176,23 @@ async def init_database() -> None:
             ALTER TABLE users
             ADD COLUMN IF NOT EXISTS
                 last_keyboard_sent_at TIMESTAMPTZ;
+
+            /*
+             * Ручная сумма покупок для старых клиентов.
+             * Это не деньги к списанию, а исторический оборот
+             * для определения уровня скидки.
+             */
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS
+                manual_spend BIGINT NOT NULL DEFAULT 0;
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS
+                bonus_updated_at TIMESTAMPTZ;
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS
+                bonus_updated_by BIGINT;
 
             CREATE INDEX IF NOT EXISTS idx_users_active
                 ON users(is_active);
@@ -247,10 +263,15 @@ async def init_database() -> None:
             CREATE INDEX IF NOT EXISTS idx_order_items_order_id
                 ON order_items(order_id);
 
+            /*
+             * Таблица истории рассылок.
+             * broadcast_type сначала nullable, чтобы выполнить
+             * миграцию со старой колонки kind.
+             */
             CREATE TABLE IF NOT EXISTS broadcast_logs (
                 id BIGSERIAL PRIMARY KEY,
-                broadcast_type TEXT NOT NULL,
-                created_by BIGINT NOT NULL,
+                broadcast_type TEXT,
+                created_by BIGINT,
                 source_chat_id BIGINT,
                 source_message_id BIGINT,
                 total_targets INTEGER NOT NULL DEFAULT 0,
@@ -262,12 +283,107 @@ async def init_database() -> None:
                 completed_at TIMESTAMPTZ
             );
 
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS broadcast_type TEXT;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS created_by BIGINT;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS total_targets INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS delivered INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS blocked INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS failed INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'created';
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS created_at
+                TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+
+            /*
+             * Исправление ошибки:
+             * column broadcast_type does not exist.
+             *
+             * В старой версии колонка называлась kind.
+             */
+            DO $broadcast_migration$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'broadcast_logs'
+                      AND column_name = 'kind'
+                )
+                THEN
+                    EXECUTE '
+                        UPDATE broadcast_logs
+                        SET broadcast_type =
+                            COALESCE(broadcast_type, kind)
+                    ';
+
+                    EXECUTE '
+                        ALTER TABLE broadcast_logs
+                        ALTER COLUMN kind DROP NOT NULL
+                    ';
+                END IF;
+            END
+            $broadcast_migration$;
+
+            UPDATE broadcast_logs
+            SET broadcast_type = 'unknown'
+            WHERE broadcast_type IS NULL;
+
+            ALTER TABLE broadcast_logs
+            ALTER COLUMN broadcast_type SET DEFAULT 'unknown';
+
+            ALTER TABLE broadcast_logs
+            ALTER COLUMN broadcast_type SET NOT NULL;
+
             CREATE INDEX IF NOT EXISTS idx_broadcast_logs_created_at
                 ON broadcast_logs(created_at DESC);
+
+            /*
+             * История ручных начислений.
+             * request_id не позволяет дважды записать
+             * одно начисление при повторном запросе.
+             */
+            CREATE TABLE IF NOT EXISTS loyalty_adjustments (
+                id BIGSERIAL PRIMARY KEY,
+                request_id TEXT UNIQUE,
+                telegram_id BIGINT NOT NULL,
+                previous_amount BIGINT NOT NULL DEFAULT 0,
+                new_amount BIGINT NOT NULL DEFAULT 0,
+                created_by BIGINT,
+                source TEXT NOT NULL DEFAULT 'manager_bonus',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_loyalty_adjustments_user
+                ON loyalty_adjustments(telegram_id);
+
+            CREATE INDEX IF NOT EXISTS idx_loyalty_adjustments_created
+                ON loyalty_adjustments(created_at DESC);
             """
         )
 
-        # После аварийного перезапуска отмечаем незавершённые рассылки.
         await conn.execute(
             """
             UPDATE broadcast_logs
@@ -284,16 +400,6 @@ async def init_database() -> None:
 async def upsert_user(
     user: types.User | None,
 ) -> asyncpg.Record | None:
-    """
-    Создаёт пользователя или обновляет его данные.
-
-    Вызывается:
-    - при /start;
-    - при любом сообщении;
-    - при callback-кнопке;
-    - при заказе из Web App.
-    """
-
     if not db_pool or not user:
         return None
 
@@ -343,7 +449,8 @@ async def upsert_user(
                 telegram_first_name,
                 telegram_last_name,
                 created_at,
-                last_bot_activity_at
+                last_bot_activity_at,
+                manual_spend
             """,
             user.id,
             user.username,
@@ -412,7 +519,7 @@ async def mark_send_success(
             """,
             telegram_id,
         )
-    else:
+    elif send_type == "keyboard":
         await db_pool.execute(
             """
             UPDATE users
@@ -422,6 +529,19 @@ async def mark_send_success(
                 last_send_error = NULL,
                 last_successful_send_at = NOW(),
                 last_keyboard_sent_at = NOW()
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+    else:
+        await db_pool.execute(
+            """
+            UPDATE users
+            SET
+                is_active = TRUE,
+                blocked_at = NULL,
+                last_send_error = NULL,
+                last_successful_send_at = NOW()
             WHERE telegram_id = $1
             """,
             telegram_id,
@@ -479,6 +599,420 @@ class UserTrackingMiddleware(BaseMiddleware):
 
 dp.message.outer_middleware(UserTrackingMiddleware())
 dp.callback_query.outer_middleware(UserTrackingMiddleware())
+
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================================
+
+def safe_int(
+    value,
+    default: int = 0,
+) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def safe_str(
+    value,
+    default: str = "",
+) -> str:
+    try:
+        if value is None:
+            return default
+
+        return str(value)
+    except Exception:
+        return default
+
+
+def is_admin(
+    telegram_id: int,
+) -> bool:
+    return telegram_id == ADMIN_CHAT_ID
+
+
+def is_blocking_error(
+    error: Exception,
+) -> bool:
+    if isinstance(error, TelegramForbiddenError):
+        return True
+
+    error_text = str(error).lower()
+
+    blocking_phrases = (
+        "bot was blocked by the user",
+        "bot was blocked",
+        "chat not found",
+        "user is deactivated",
+        "bot was kicked",
+        "forbidden",
+    )
+
+    return any(
+        phrase in error_text
+        for phrase in blocking_phrases
+    )
+
+
+def parse_money_amount(
+    value: str,
+) -> int | None:
+    cleaned = (
+        str(value or "")
+        .replace("฿", "")
+        .replace("₽", "")
+        .replace(" ", "")
+        .replace(",", "")
+        .strip()
+    )
+
+    if not cleaned.isdigit():
+        return None
+
+    amount = int(cleaned)
+
+    if amount < 0 or amount > 10_000_000:
+        return None
+
+    return amount
+
+
+def discount_by_spend(
+    total_spend: int,
+) -> int:
+    if total_spend >= 20_000:
+        return 20
+
+    if total_spend >= 15_000:
+        return 15
+
+    if total_spend >= 10_000:
+        return 10
+
+    if total_spend >= 5_000:
+        return 5
+
+    return 0
+
+
+# ============================================================================
+# HEALTHCHECK И ПЛАНОВЫЙ ПЕРЕЗАПУСК
+# ============================================================================
+
+def run_fake_server(
+    port: int = PORT,
+) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def log_message(
+            self,
+            format: str,
+            *args,
+        ) -> None:
+            return
+
+    server = HTTPServer(
+        ("", port),
+        Handler,
+    )
+
+    threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    ).start()
+
+
+def schedule_restart() -> None:
+    if RESTART_MINUTES <= 0:
+        logger.info("Плановый перезапуск отключён")
+        return
+
+    def _restart() -> None:
+        global broadcast_running
+
+        if broadcast_running:
+            logger.warning(
+                "Перезапуск отложен: сейчас выполняется рассылка"
+            )
+
+            retry_timer = threading.Timer(
+                600,
+                _restart,
+            )
+            retry_timer.daemon = True
+            retry_timer.start()
+            return
+
+        os.execv(
+            sys.executable,
+            [sys.executable] + sys.argv,
+        )
+
+    timer = threading.Timer(
+        RESTART_MINUTES * 60,
+        _restart,
+    )
+    timer.daemon = True
+    timer.start()
+
+
+# ============================================================================
+# ПОДПИСАННАЯ ССЫЛКА MINI APP
+# ============================================================================
+
+def build_signed_webapp_url(
+    user: types.User,
+) -> str:
+    payload = {
+        "i": user.id,
+        "n": user.username or "",
+        "f": user.first_name or "",
+        "l": user.last_name or "",
+        "t": int(time.time()),
+    }
+
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+    token = (
+        base64.urlsafe_b64encode(payload_json)
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+    signature = hmac.new(
+        API_TOKEN.encode("utf-8"),
+        token.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    parts = urlsplit(WEBAPP_URL)
+
+    query = dict(
+        parse_qsl(
+            parts.query,
+            keep_blank_values=True,
+        )
+    )
+
+    query.update(
+        {
+            "u": token,
+            "s": signature,
+        }
+    )
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path or "/",
+            urlencode(query),
+            parts.fragment,
+        )
+    )
+
+
+def start_keyboard(
+    user: types.User,
+) -> types.ReplyKeyboardMarkup:
+    web_app_btn = types.KeyboardButton(
+        text=MENU_BTN_TEXT,
+        web_app=types.WebAppInfo(
+            url=build_signed_webapp_url(user)
+        ),
+    )
+
+    ask_btn = types.KeyboardButton(
+        text=ASK_BTN_TEXT
+    )
+
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [web_app_btn],
+            [ask_btn],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def updated_keyboard(
+    user: types.User,
+) -> types.ReplyKeyboardMarkup:
+    return start_keyboard(user)
+
+
+async def send_main_keyboard(
+    message: types.Message,
+    text: str,
+    force: bool = False,
+) -> bool:
+    uid = message.from_user.id
+
+    if uid in KEYBOARD_SHOWN_USERS and not force:
+        return False
+
+    await message.answer(
+        text,
+        reply_markup=start_keyboard(message.from_user),
+    )
+
+    KEYBOARD_SHOWN_USERS.add(uid)
+
+    return True
+
+
+def make_user_from_database(
+    row: asyncpg.Record,
+) -> types.User:
+    return types.User(
+        id=int(row["telegram_id"]),
+        is_bot=False,
+        first_name=(
+            row["telegram_first_name"]
+            or "Пользователь"
+        ),
+        last_name=row["telegram_last_name"],
+        username=row["username"],
+    )
+
+
+# ============================================================================
+# КНОПКИ
+# ============================================================================
+
+def build_admin_kb_full(
+    client_id: int,
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="👤 Открыть профиль клиента",
+        url=f"tg://user?id={client_id}",
+    )
+
+    kb.button(
+        text="✍️ Написать клиенту",
+        callback_data=f"write_client:{client_id}",
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+def build_admin_kb_safe(
+    client_id: int,
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="✍️ Написать клиенту",
+        callback_data=f"write_client:{client_id}",
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+def build_unsubscribe_keyboard() -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="🔕 Не получать рекламу",
+        callback_data="unsubscribe_ads",
+    )
+
+    return kb.as_markup()
+
+
+def build_broadcast_confirm_keyboard() -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="✅ Начать рассылку",
+        callback_data="broadcast_confirm",
+    )
+
+    kb.button(
+        text="❌ Отменить",
+        callback_data="broadcast_cancel",
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+def build_keyboard_update_confirm() -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="✅ Отправить клавиатуру всем",
+        callback_data="keyboard_update_confirm",
+    )
+
+    kb.button(
+        text="❌ Отменить",
+        callback_data="keyboard_update_cancel",
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+# ============================================================================
+# ОТПРАВКА ЗАКАЗА МЕНЕДЖЕРУ
+# ============================================================================
+
+async def send_order_to_admin(
+    admin_text_html: str,
+    client_id: int,
+) -> None:
+    try:
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            admin_text_html,
+            parse_mode="HTML",
+            reply_markup=build_admin_kb_full(client_id),
+        )
+
+        logger.info(
+            "ADMIN: sent with full kb (profile+reply)"
+        )
+
+    except Exception as exc:
+        error_text = str(exc)
+
+        logger.error(
+            "ADMIN send failed (full kb): %s",
+            error_text,
+        )
+
+        if "BUTTON_USER_PRIVACY_RESTRICTED" in error_text:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                admin_text_html,
+                parse_mode="HTML",
+                reply_markup=build_admin_kb_safe(client_id),
+            )
+            return
+
+        raise
 
 
 # ============================================================================
@@ -761,393 +1295,24 @@ async def build_daily_report() -> str:
 
     return (
         f"📊 Статистика за {today}\n\n"
-
         f"👥 Всего ID в базе: {int(row['total_users'] or 0)}\n"
         f"✅ Активных пользователей: {int(row['active_users'] or 0)}\n"
         f"📣 Доступно для рекламы: {int(row['marketing_users'] or 0)}\n"
         f"🚫 Заблокировали/недоступны: {int(row['blocked_users'] or 0)}\n"
         f"💬 Пользователей бота сегодня: {int(row['active_today'] or 0)}\n"
         f"🆕 Новых пользователей: {int(row['new_users'] or 0)}\n\n"
-
         f"Открытий сайта: {visits}\n"
         f"Уникальных посетителей: {unique_visitors}\n\n"
-
         f"Заказов: {orders_count}\n"
         f"Покупателей: {int(row['buyers'] or 0)}\n"
         f"Конверсия: {conversion:.1f}%\n\n"
-
         f"Выручка: {int(row['revenue'] or 0)} ฿\n"
         f"Средний чек: {round(float(row['avg_check'] or 0))} ฿"
     )
 
 
 # ============================================================================
-# HEALTHCHECK И ПЛАНОВЫЙ ПЕРЕЗАПУСК
-# ============================================================================
-
-def run_fake_server(port: int = PORT) -> None:
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-
-        def log_message(self, format: str, *args) -> None:
-            return
-
-    server = HTTPServer(("", port), Handler)
-
-    threading.Thread(
-        target=server.serve_forever,
-        daemon=True,
-    ).start()
-
-
-def schedule_restart() -> None:
-    if RESTART_MINUTES <= 0:
-        logger.info("Плановый перезапуск отключён")
-        return
-
-    def _restart() -> None:
-        global broadcast_running
-
-        # Не перезапускаем процесс посреди рассылки.
-        if broadcast_running:
-            logger.warning(
-                "Перезапуск отложен: сейчас выполняется рассылка"
-            )
-
-            retry_timer = threading.Timer(
-                600,
-                _restart,
-            )
-            retry_timer.daemon = True
-            retry_timer.start()
-            return
-
-        os.execv(
-            sys.executable,
-            [sys.executable] + sys.argv,
-        )
-
-    timer = threading.Timer(
-        RESTART_MINUTES * 60,
-        _restart,
-    )
-    timer.daemon = True
-    timer.start()
-
-
-# ============================================================================
-# ПОДПИСАННАЯ ССЫЛКА MINI APP — СОХРАНЕНА
-# ============================================================================
-
-def build_signed_webapp_url(
-    user: types.User,
-) -> str:
-    payload = {
-        "i": user.id,
-        "n": user.username or "",
-        "f": user.first_name or "",
-        "l": user.last_name or "",
-        "t": int(time.time()),
-    }
-
-    payload_json = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-
-    token = (
-        base64.urlsafe_b64encode(payload_json)
-        .decode("ascii")
-        .rstrip("=")
-    )
-
-    signature = hmac.new(
-        API_TOKEN.encode("utf-8"),
-        token.encode("ascii"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    parts = urlsplit(WEBAPP_URL)
-
-    query = dict(
-        parse_qsl(
-            parts.query,
-            keep_blank_values=True,
-        )
-    )
-
-    query.update(
-        {
-            "u": token,
-            "s": signature,
-        }
-    )
-
-    return urlunsplit(
-        (
-            parts.scheme,
-            parts.netloc,
-            parts.path or "/",
-            urlencode(query),
-            parts.fragment,
-        )
-    )
-
-
-def start_keyboard(
-    user: types.User,
-) -> types.ReplyKeyboardMarkup:
-    web_app_btn = types.KeyboardButton(
-        text=MENU_BTN_TEXT,
-        web_app=types.WebAppInfo(
-            url=build_signed_webapp_url(user)
-        ),
-    )
-
-    ask_btn = types.KeyboardButton(
-        text=ASK_BTN_TEXT
-    )
-
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [web_app_btn],
-            [ask_btn],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-
-def updated_keyboard(
-    user: types.User,
-) -> types.ReplyKeyboardMarkup:
-    return start_keyboard(user)
-
-
-async def send_main_keyboard(
-    message: types.Message,
-    text: str,
-    force: bool = False,
-) -> bool:
-    uid = message.from_user.id
-
-    if uid in KEYBOARD_SHOWN_USERS and not force:
-        return False
-
-    await message.answer(
-        text,
-        reply_markup=start_keyboard(message.from_user),
-    )
-
-    KEYBOARD_SHOWN_USERS.add(uid)
-    return True
-
-
-def make_user_from_database(
-    row: asyncpg.Record,
-) -> types.User:
-    return types.User(
-        id=int(row["telegram_id"]),
-        is_bot=False,
-        first_name=row["telegram_first_name"] or "Пользователь",
-        last_name=row["telegram_last_name"],
-        username=row["username"],
-    )
-
-
-# ============================================================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================================================
-
-def safe_int(
-    value,
-    default: int = 0,
-) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def safe_str(
-    value,
-    default: str = "",
-) -> str:
-    try:
-        if value is None:
-            return default
-
-        return str(value)
-    except Exception:
-        return default
-
-
-def is_admin(
-    telegram_id: int,
-) -> bool:
-    return telegram_id == ADMIN_CHAT_ID
-
-
-def is_blocking_error(
-    error: Exception,
-) -> bool:
-    if isinstance(error, TelegramForbiddenError):
-        return True
-
-    error_text = str(error).lower()
-
-    blocking_phrases = (
-        "bot was blocked by the user",
-        "bot was blocked",
-        "chat not found",
-        "user is deactivated",
-        "bot was kicked",
-        "forbidden",
-    )
-
-    return any(
-        phrase in error_text
-        for phrase in blocking_phrases
-    )
-
-
-# ============================================================================
-# КНОПКИ МЕНЕДЖЕРА И РАССЫЛОК
-# ============================================================================
-
-def build_admin_kb_full(
-    client_id: int,
-) -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-
-    kb.button(
-        text="👤 Открыть профиль клиента",
-        url=f"tg://user?id={client_id}",
-    )
-
-    kb.button(
-        text="✍️ Написать клиенту",
-        callback_data=f"write_client:{client_id}",
-    )
-
-    kb.adjust(1)
-
-    return kb.as_markup()
-
-
-def build_admin_kb_safe(
-    client_id: int,
-) -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-
-    kb.button(
-        text="✍️ Написать клиенту",
-        callback_data=f"write_client:{client_id}",
-    )
-
-    kb.adjust(1)
-
-    return kb.as_markup()
-
-
-def build_unsubscribe_keyboard() -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-
-    kb.button(
-        text="🔕 Не получать рекламу",
-        callback_data="unsubscribe_ads",
-    )
-
-    return kb.as_markup()
-
-
-def build_broadcast_confirm_keyboard() -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-
-    kb.button(
-        text="✅ Начать рассылку",
-        callback_data="broadcast_confirm",
-    )
-
-    kb.button(
-        text="❌ Отменить",
-        callback_data="broadcast_cancel",
-    )
-
-    kb.adjust(1)
-
-    return kb.as_markup()
-
-
-def build_keyboard_update_confirm() -> types.InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-
-    kb.button(
-        text="✅ Отправить клавиатуру всем",
-        callback_data="keyboard_update_confirm",
-    )
-
-    kb.button(
-        text="❌ Отменить",
-        callback_data="keyboard_update_cancel",
-    )
-
-    kb.adjust(1)
-
-    return kb.as_markup()
-
-
-async def send_order_to_admin(
-    admin_text_html: str,
-    client_id: int,
-) -> None:
-    try:
-        await bot.send_message(
-            ADMIN_CHAT_ID,
-            admin_text_html,
-            parse_mode="HTML",
-            reply_markup=build_admin_kb_full(client_id),
-        )
-
-        logger.info(
-            "ADMIN: sent with full kb (profile+reply)"
-        )
-
-    except Exception as exc:
-        error_text = str(exc)
-
-        logger.error(
-            "ADMIN send failed (full kb): %s",
-            error_text,
-        )
-
-        if "BUTTON_USER_PRIVACY_RESTRICTED" in error_text:
-            logger.warning(
-                "Privacy restricted: resend without profile button"
-            )
-
-            await bot.send_message(
-                ADMIN_CHAT_ID,
-                admin_text_html,
-                parse_mode="HTML",
-                reply_markup=build_admin_kb_safe(client_id),
-            )
-
-            logger.info(
-                "ADMIN: sent with SAFE kb (reply only)"
-            )
-            return
-
-        raise
-
-
-# ============================================================================
-# БАЗА ПОЛЬЗОВАТЕЛЕЙ
+# РАССЫЛКИ
 # ============================================================================
 
 async def get_broadcast_targets(
@@ -1197,6 +1362,7 @@ async def get_broadcast_target_count(
     targets = await get_broadcast_targets(
         broadcast_type
     )
+
     return len(targets)
 
 
@@ -1268,10 +1434,6 @@ async def finish_broadcast_log(
     )
 
 
-# ============================================================================
-# ОТПРАВКА ОДНОМУ ПОЛЬЗОВАТЕЛЮ
-# ============================================================================
-
 async def send_advertising_message(
     telegram_id: int,
     source_chat_id: int,
@@ -1303,12 +1465,7 @@ async def send_advertising_message(
             source_message_id,
         )
 
-    except (
-        TelegramForbiddenError,
-        TelegramBadRequest,
-        TelegramNetworkError,
-        Exception,
-    ) as exc:
+    except Exception as exc:
         blocked = is_blocking_error(exc)
 
         await mark_send_error(
@@ -1366,12 +1523,7 @@ async def send_new_keyboard(
             user_row
         )
 
-    except (
-        TelegramForbiddenError,
-        TelegramBadRequest,
-        TelegramNetworkError,
-        Exception,
-    ) as exc:
+    except Exception as exc:
         blocked = is_blocking_error(exc)
 
         await mark_send_error(
@@ -1391,10 +1543,6 @@ async def send_new_keyboard(
 
         return "failed"
 
-
-# ============================================================================
-# МАССОВАЯ РАССЫЛКА
-# ============================================================================
 
 async def run_broadcast(
     broadcast_type: str,
@@ -1553,6 +1701,375 @@ async def run_broadcast(
 
 
 # ============================================================================
+# РУЧНАЯ СУММА ЛОЯЛЬНОСТИ /bonus
+# ============================================================================
+
+def make_bonus_request_payload(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+    timestamp: int,
+    request_id: str,
+) -> str:
+    """
+    JSON с сортировкой ключей.
+    server.js создаёт строку в таком же порядке.
+    """
+    return json.dumps(
+        {
+            "amount": amount,
+            "managerId": manager_id,
+            "requestId": request_id,
+            "telegramId": str(telegram_id),
+            "timestamp": timestamp,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+async def update_bonus_in_mini_app(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+    request_id: str,
+) -> dict:
+    """
+    Обновляет сумму именно в базе mini-app.
+
+    Даже если бот и mini-app подключены к разным PostgreSQL,
+    личный кабинет увидит сумму.
+    """
+
+    timestamp = int(time.time())
+
+    payload_string = make_bonus_request_payload(
+        telegram_id,
+        amount,
+        manager_id,
+        timestamp,
+        request_id,
+    )
+
+    signature = hmac.new(
+        API_TOKEN.encode("utf-8"),
+        payload_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    request_body = {
+        "telegramId": str(telegram_id),
+        "amount": amount,
+        "managerId": manager_id,
+        "timestamp": timestamp,
+        "requestId": request_id,
+    }
+
+    url = f"{WEBAPP_URL}/api/admin/bonus"
+
+    timeout = aiohttp.ClientTimeout(
+        total=15
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+        async with session.post(
+            url,
+            json=request_body,
+            headers={
+                "X-Bonus-Signature": signature,
+            },
+        ) as response:
+            response_text = await response.text()
+
+            try:
+                response_data = json.loads(
+                    response_text
+                )
+            except Exception:
+                response_data = {
+                    "ok": False,
+                    "error": response_text,
+                }
+
+            if (
+                response.status != 200
+                or not response_data.get("ok")
+            ):
+                raise RuntimeError(
+                    response_data.get("error")
+                    or (
+                        "Mini App вернул ошибку "
+                        f"HTTP {response.status}"
+                    )
+                )
+
+            return response_data
+
+
+async def save_bonus_in_bot_database(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+    request_id: str,
+) -> int:
+    """
+    Дублирует сумму в базе бота для отчётов и аудита.
+    Если база общая с mini-app, request_id защитит
+    историю от двойной записи.
+    """
+
+    if not db_pool:
+        raise RuntimeError(
+            "База данных бота не подключена"
+        )
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            previous_amount = await conn.fetchval(
+                """
+                SELECT manual_spend
+                FROM users
+                WHERE telegram_id = $1
+                """,
+                telegram_id,
+            )
+
+            previous_amount = int(
+                previous_amount or 0
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    telegram_id,
+                    manual_spend,
+                    bonus_updated_at,
+                    bonus_updated_by,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    NOW(),
+                    $3,
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT (telegram_id)
+                DO UPDATE SET
+                    manual_spend = EXCLUDED.manual_spend,
+                    bonus_updated_at = NOW(),
+                    bonus_updated_by = EXCLUDED.bonus_updated_by,
+                    updated_at = NOW()
+                """,
+                telegram_id,
+                amount,
+                manager_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO loyalty_adjustments (
+                    request_id,
+                    telegram_id,
+                    previous_amount,
+                    new_amount,
+                    created_by,
+                    source
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    $4,
+                    $5,
+                    'manager_bonus'
+                )
+                ON CONFLICT (request_id)
+                DO NOTHING
+                """,
+                request_id,
+                telegram_id,
+                previous_amount,
+                amount,
+                manager_id,
+            )
+
+            return previous_amount
+
+
+async def apply_manager_bonus(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+) -> dict:
+    request_id = (
+        f"bonus:{manager_id}:"
+        f"{telegram_id}:"
+        f"{amount}:"
+        f"{time.time_ns()}"
+    )
+
+    mini_app_result = await update_bonus_in_mini_app(
+        telegram_id,
+        amount,
+        manager_id,
+        request_id,
+    )
+
+    previous_local = await save_bonus_in_bot_database(
+        telegram_id,
+        amount,
+        manager_id,
+        request_id,
+    )
+
+    mini_app_result["previousLocalAmount"] = previous_local
+
+    return mini_app_result
+
+
+async def notify_user_about_bonus(
+    telegram_id: int,
+    total_spend: int,
+    discount_percent: int,
+) -> str:
+    try:
+        await bot.send_message(
+            telegram_id,
+            (
+                "🎁 Ваша накопленная сумма "
+                "в программе лояльности обновлена.\n\n"
+                f"Накопленная сумма: {total_spend:,} ฿\n"
+                f"Текущая скидка: {discount_percent}%\n\n"
+                "Информация уже доступна "
+                "в личном кабинете."
+            ).replace(",", " "),
+        )
+
+        await mark_send_success(
+            telegram_id,
+            "direct",
+        )
+
+        return "sent"
+
+    except Exception as exc:
+        blocked = is_blocking_error(exc)
+
+        await mark_send_error(
+            telegram_id,
+            str(exc),
+            blocked,
+        )
+
+        return "blocked" if blocked else "failed"
+
+
+async def process_bonus_amount(
+    message: types.Message,
+    telegram_id: int,
+    amount: int,
+) -> None:
+    await message.answer(
+        (
+            "⏳ Сохраняю сумму в личный кабинет...\n\n"
+            f"Telegram ID: {telegram_id}\n"
+            f"Ручная сумма: {amount:,} ฿"
+        ).replace(",", " ")
+    )
+
+    try:
+        result = await apply_manager_bonus(
+            telegram_id,
+            amount,
+            message.from_user.id,
+        )
+
+        manual_spend = int(
+            result.get("manualSpend", amount)
+            or amount
+        )
+
+        order_spend = int(
+            result.get("orderSpend", 0)
+            or 0
+        )
+
+        total_spend = int(
+            result.get(
+                "totalSpend",
+                manual_spend + order_spend,
+            )
+            or 0
+        )
+
+        discount_percent = int(
+            result.get(
+                "discountPercent",
+                discount_by_spend(total_spend),
+            )
+            or 0
+        )
+
+        notification_status = await notify_user_about_bonus(
+            telegram_id,
+            total_spend,
+            discount_percent,
+        )
+
+        notification_text = {
+            "sent": "Пользователь уведомлён.",
+            "blocked": (
+                "Пользователь заблокировал бота, "
+                "но сумма в ЛК сохранена."
+            ),
+            "failed": (
+                "Сумма сохранена, но уведомление "
+                "отправить не удалось."
+            ),
+        }.get(
+            notification_status,
+            "Статус уведомления неизвестен.",
+        )
+
+        await message.answer(
+            (
+                "✅ Сумма сохранена в личном кабинете\n\n"
+                f"Telegram ID: {telegram_id}\n"
+                f"Фактические заказы: {order_spend:,} ฿\n"
+                f"Ручная сумма: {manual_spend:,} ฿\n"
+                f"Общая накопленная сумма: {total_spend:,} ฿\n"
+                f"Уровень скидки: {discount_percent}%\n\n"
+                f"{notification_text}"
+            ).replace(",", " ")
+        )
+
+        waiting_bonus.pop(
+            message.from_user.id,
+            None,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "BONUS SAVE ERROR"
+        )
+
+        await message.answer(
+            (
+                "⚠️ Не удалось сохранить сумму.\n\n"
+                f"Ошибка: {exc}\n\n"
+                "Состояние команды сохранено. "
+                "Можно повторно отправить сумму "
+                "или выполнить /cancel."
+            )
+        )
+
+
+# ============================================================================
 # ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ
 # ============================================================================
 
@@ -1564,8 +2081,6 @@ async def cmd_start(
         message.from_user
     )
 
-    # Повторное обращение снова разрешает сообщения,
-    # но не включает рекламу, если пользователь сам её отключил.
     await send_main_keyboard(
         message,
         (
@@ -1613,9 +2128,7 @@ async def cmd_ads_on(
     )
 
 
-@dp.callback_query(
-    F.data == "unsubscribe_ads"
-)
+@dp.callback_query(F.data == "unsubscribe_ads")
 async def callback_unsubscribe_ads(
     call: types.CallbackQuery,
 ) -> None:
@@ -1641,11 +2154,6 @@ async def callback_unsubscribe_ads(
 async def refresh_menu_keyboard(
     message: types.Message,
 ) -> None:
-    """
-    Обрабатывает старую текстовую кнопку,
-    которая могла остаться у пользователя.
-    """
-
     await upsert_user(
         message.from_user
     )
@@ -1688,16 +2196,10 @@ async def open_manager_chat(
     )
 
 
-@dp.callback_query(
-    F.data == "back_to_menu"
-)
+@dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(
     call: types.CallbackQuery,
 ) -> None:
-    await upsert_user(
-        call.from_user
-    )
-
     await call.message.answer(
         "Ок. Возвращаю кнопки меню 👇",
         reply_markup=start_keyboard(call.from_user),
@@ -1733,7 +2235,39 @@ async def cmd_admin_help(
             "/broadcast — создать рекламу\n"
             "/broadcast_history — история рассылок\n"
             "/update_keyboard — обновить клавиатуру всем\n"
+            "/bonus — установить ручную накопленную сумму\n"
             "/cancel — отменить текущее действие"
+        )
+    )
+
+
+@dp.message(Command("bonus"))
+async def cmd_bonus(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    waiting_bonus[
+        message.from_user.id
+    ] = {
+        "stage": "telegram_id"
+    }
+
+    await message.answer(
+        (
+            "🎁 Ручная сумма лояльности\n\n"
+            "Пришли Telegram ID и сумму.\n\n"
+            "Можно одним сообщением:\n"
+            "123456789 5000\n\n"
+            "Или сначала отправить ID, "
+            "а следующим сообщением сумму.\n\n"
+            "Сумма заменит прежнюю ручную сумму. "
+            "Фактические заказы не изменятся.\n\n"
+            "Для сброса ручной суммы укажи 0.\n"
+            "Отмена: /cancel"
         )
     )
 
@@ -1811,6 +2345,7 @@ async def cmd_users(
             telegram_last_name,
             is_active,
             marketing_allowed,
+            manual_spend,
             last_bot_activity_at
         FROM users
         ORDER BY
@@ -1859,11 +2394,18 @@ async def cmd_users(
             else "🔕"
         )
 
+        manual_spend = int(
+            user["manual_spend"] or 0
+        )
+
         lines.append(
-            f"{active_icon}{ads_icon} "
-            f"{user['telegram_id']} — "
-            f"{full_name or 'Без имени'} — "
-            f"{username}"
+            (
+                f"{active_icon}{ads_icon} "
+                f"{user['telegram_id']} — "
+                f"{full_name or 'Без имени'} — "
+                f"{username} — "
+                f"ручная сумма {manual_spend} ฿"
+            )
         )
 
     await message.answer(
@@ -1936,6 +2478,9 @@ async def cmd_check_user(
             f"Имя в заказе: {user['profile_name'] or '-'}\n"
             f"Телефон: {user['phone'] or '-'}\n"
             f"Адрес: {user['address'] or '-'}\n"
+            f"Ручная сумма: {int(user['manual_spend'] or 0)} ฿\n"
+            f"Обновил сумму: {user['bonus_updated_by'] or '-'}\n"
+            f"Дата обновления: {user['bonus_updated_at'] or '-'}\n"
             f"Активен: {'да' if user['is_active'] else 'нет'}\n"
             f"Реклама разрешена: "
             f"{'да' if user['marketing_allowed'] else 'нет'}\n"
@@ -1972,6 +2517,9 @@ async def cmd_export_users(
             profile_name,
             phone,
             address,
+            manual_spend,
+            bonus_updated_at,
+            bonus_updated_by,
             is_active,
             marketing_allowed,
             created_at,
@@ -1996,6 +2544,9 @@ async def cmd_export_users(
         "profile_name",
         "phone",
         "address",
+        "manual_spend",
+        "bonus_updated_at",
+        "bonus_updated_by",
         "is_active",
         "marketing_allowed",
         "created_at",
@@ -2075,9 +2626,7 @@ async def cmd_broadcast(
     )
 
 
-@dp.callback_query(
-    F.data == "broadcast_confirm"
-)
+@dp.callback_query(F.data == "broadcast_confirm")
 async def callback_broadcast_confirm(
     call: types.CallbackQuery,
 ) -> None:
@@ -2133,9 +2682,7 @@ async def callback_broadcast_confirm(
     )
 
 
-@dp.callback_query(
-    F.data == "broadcast_cancel"
-)
+@dp.callback_query(F.data == "broadcast_cancel")
 async def callback_broadcast_cancel(
     call: types.CallbackQuery,
 ) -> None:
@@ -2225,7 +2772,7 @@ async def cmd_broadcast_history(
 
 
 # ============================================================================
-# МАССОВОЕ ОБНОВЛЕНИЕ КЛАВИАТУРЫ
+# ОБНОВЛЕНИЕ КЛАВИАТУРЫ
 # ============================================================================
 
 @dp.message(Command("update_keyboard"))
@@ -2258,9 +2805,7 @@ async def cmd_update_keyboard(
     )
 
 
-@dp.callback_query(
-    F.data == "keyboard_update_confirm"
-)
+@dp.callback_query(F.data == "keyboard_update_confirm")
 async def callback_keyboard_update_confirm(
     call: types.CallbackQuery,
 ) -> None:
@@ -2296,9 +2841,7 @@ async def callback_keyboard_update_confirm(
     )
 
 
-@dp.callback_query(
-    F.data == "keyboard_update_cancel"
-)
+@dp.callback_query(F.data == "keyboard_update_cancel")
 async def callback_keyboard_update_cancel(
     call: types.CallbackQuery,
 ) -> None:
@@ -2323,16 +2866,10 @@ async def callback_keyboard_update_cancel(
 # ОТВЕТ КЛИЕНТУ
 # ============================================================================
 
-@dp.callback_query(
-    F.data.startswith("write_client:")
-)
+@dp.callback_query(F.data.startswith("write_client:"))
 async def cb_write_client(
     call: types.CallbackQuery,
 ) -> None:
-    await upsert_user(
-        call.from_user
-    )
-
     if not is_admin(
         call.from_user.id
     ):
@@ -2378,23 +2915,31 @@ async def cmd_cancel(
         return
 
     cancelled = False
+    admin_id = message.from_user.id
 
-    if message.from_user.id in waiting_reply:
+    if admin_id in waiting_reply:
         waiting_reply.pop(
-            message.from_user.id,
+            admin_id,
             None,
         )
         cancelled = True
 
-    if message.from_user.id in waiting_broadcast:
+    if admin_id in waiting_broadcast:
         waiting_broadcast.discard(
-            message.from_user.id
+            admin_id
         )
         cancelled = True
 
-    if message.from_user.id in pending_broadcasts:
+    if admin_id in pending_broadcasts:
         pending_broadcasts.pop(
-            message.from_user.id,
+            admin_id,
+            None,
+        )
+        cancelled = True
+
+    if admin_id in waiting_bonus:
+        waiting_bonus.pop(
+            admin_id,
             None,
         )
         cancelled = True
@@ -2410,12 +2955,10 @@ async def cmd_cancel(
 
 
 # ============================================================================
-# ЗАКАЗЫ ИЗ TELEGRAM WEB APP — СОХРАНЕНЫ
+# ЗАКАЗЫ ИЗ TELEGRAM WEB APP
 # ============================================================================
 
-@dp.message(
-    F.content_type == ContentType.WEB_APP_DATA
-)
+@dp.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_order(
     message: types.Message,
 ) -> None:
@@ -2724,22 +3267,178 @@ async def handle_order(
 # СООБЩЕНИЯ АДМИНИСТРАТОРА
 # ============================================================================
 
-@dp.message(
-    F.from_user.id == ADMIN_CHAT_ID
-)
+@dp.message(F.from_user.id == ADMIN_CHAT_ID)
 async def admin_message_router(
     message: types.Message,
 ) -> None:
     admin_id = message.from_user.id
 
-    # Команды уже обрабатываются отдельными обработчиками.
     if (
         message.text
         and message.text.startswith("/")
     ):
         return
 
-    # Ответ менеджера конкретному клиенту.
+    # --------------------------------------------------------
+    # Команда /bonus
+    # --------------------------------------------------------
+
+    if admin_id in waiting_bonus:
+        state = waiting_bonus[admin_id]
+
+        if not message.text:
+            await message.answer(
+                "Отправь ID и сумму обычным текстом."
+            )
+            return
+
+        text = message.text.strip()
+        parts = text.split()
+
+        # Можно прислать ID и сумму одним сообщением.
+        if (
+            state.get("stage") == "telegram_id"
+            and len(parts) >= 2
+        ):
+            try:
+                telegram_id = int(parts[0])
+            except ValueError:
+                await message.answer(
+                    "Telegram ID должен состоять из цифр."
+                )
+                return
+
+            amount_text = "".join(parts[1:])
+            amount = parse_money_amount(
+                amount_text
+            )
+
+            if amount is None:
+                await message.answer(
+                    (
+                        "Сумма указана неправильно.\n"
+                        "Пример: 123456789 5000"
+                    )
+                )
+                return
+
+            await process_bonus_amount(
+                message,
+                telegram_id,
+                amount,
+            )
+            return
+
+        # Сначала принимаем только ID.
+        if state.get("stage") == "telegram_id":
+            try:
+                telegram_id = int(text)
+            except ValueError:
+                await message.answer(
+                    (
+                        "Telegram ID должен состоять из цифр.\n"
+                        "Пример: 123456789"
+                    )
+                )
+                return
+
+            state["telegram_id"] = telegram_id
+            state["stage"] = "amount"
+
+            known_user = None
+
+            if db_pool:
+                known_user = await db_pool.fetchrow(
+                    """
+                    SELECT
+                        telegram_first_name,
+                        telegram_last_name,
+                        username,
+                        manual_spend
+                    FROM users
+                    WHERE telegram_id = $1
+                    """,
+                    telegram_id,
+                )
+
+            if known_user:
+                full_name = " ".join(
+                    part
+                    for part in (
+                        known_user["telegram_first_name"],
+                        known_user["telegram_last_name"],
+                    )
+                    if part
+                ).strip()
+
+                username = (
+                    f"@{known_user['username']}"
+                    if known_user["username"]
+                    else "без username"
+                )
+
+                current_manual = int(
+                    known_user["manual_spend"] or 0
+                )
+
+                await message.answer(
+                    (
+                        "✅ Пользователь найден\n\n"
+                        f"ID: {telegram_id}\n"
+                        f"Имя: {full_name or '-'}\n"
+                        f"Username: {username}\n"
+                        f"Текущая ручная сумма: "
+                        f"{current_manual:,} ฿\n\n"
+                        "Теперь отправь новую сумму.\n"
+                        "Пример: 5000"
+                    ).replace(",", " ")
+                )
+            else:
+                await message.answer(
+                    (
+                        f"ID принят: {telegram_id}\n\n"
+                        "В базе бота пользователь пока не найден, "
+                        "но сумма всё равно будет записана "
+                        "в его личный кабинет.\n\n"
+                        "Теперь отправь сумму.\n"
+                        "Пример: 5000"
+                    )
+                )
+
+            return
+
+        # Принимаем сумму после ID.
+        if state.get("stage") == "amount":
+            amount = parse_money_amount(
+                text
+            )
+
+            if amount is None:
+                await message.answer(
+                    (
+                        "Сумма указана неправильно.\n"
+                        "Отправь целое число от 0 "
+                        "до 10 000 000.\n"
+                        "Пример: 5000"
+                    )
+                )
+                return
+
+            telegram_id = int(
+                state["telegram_id"]
+            )
+
+            await process_bonus_amount(
+                message,
+                telegram_id,
+                amount,
+            )
+            return
+
+    # --------------------------------------------------------
+    # Ответ клиенту
+    # --------------------------------------------------------
+
     if admin_id in waiting_reply:
         if not message.text:
             await message.answer(
@@ -2795,7 +3494,10 @@ async def admin_message_router(
 
         return
 
-    # Администратор прислал сообщение для рекламной рассылки.
+    # --------------------------------------------------------
+    # Рекламная рассылка
+    # --------------------------------------------------------
+
     if admin_id in waiting_broadcast:
         waiting_broadcast.discard(
             admin_id
@@ -2857,10 +3559,6 @@ async def admin_message_router(
 async def ensure_keyboard_if_missing(
     message: types.Message,
 ) -> None:
-    await upsert_user(
-        message.from_user
-    )
-
     if (
         message.content_type
         == ContentType.WEB_APP_DATA
