@@ -386,6 +386,67 @@ async def init_database() -> None:
             );
 
 
+            /*
+             * Номер заказа назначает только бот.
+             * Первый новый номер: SM-472.
+             */
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS order_number TEXT;
+
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_number
+            ON orders(order_number)
+            WHERE order_number IS NOT NULL;
+
+
+            /*
+             * Последовательность хранится в PostgreSQL,
+             * поэтому не сбрасывается при Redeploy Railway.
+             *
+             * Если последовательность создаётся впервые,
+             * учитываем уже записанные номера SM-*.
+             */
+            DO $order_number_sequence$
+            DECLARE
+                max_existing_number BIGINT;
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_class
+                    WHERE relkind = 'S'
+                      AND relname = 'sm_order_number_seq'
+                )
+                THEN
+                    CREATE SEQUENCE sm_order_number_seq
+                    START WITH 472
+                    INCREMENT BY 1
+                    MINVALUE 1
+                    NO MAXVALUE
+                    CACHE 1;
+
+                    SELECT COALESCE(
+                        MAX(
+                            CASE
+                                WHEN order_number ~ '^SM-[0-9]+$'
+                                THEN SUBSTRING(order_number FROM 4)::BIGINT
+                                ELSE NULL
+                            END
+                        ),
+                        471
+                    )
+                    INTO max_existing_number
+                    FROM orders;
+
+                    PERFORM setval(
+                        'sm_order_number_seq',
+                        GREATEST(max_existing_number, 471),
+                        TRUE
+                    );
+                END IF;
+            END
+            $order_number_sequence$;
+
+
             CREATE INDEX IF NOT EXISTS idx_orders_created_at
             ON orders(created_at);
 
@@ -1308,9 +1369,19 @@ async def save_order_to_database(
     user: types.User,
     data: dict,
     order_items: list[dict],
-) -> int | None:
+) -> tuple[int, str]:
+    """
+    Сохраняет заказ и атомарно получает следующий номер SM-*.
+
+    PostgreSQL sequence гарантирует, что два одновременных
+    заказа не получат один номер. После перезапуска Railway
+    счётчик продолжает работу с последнего значения.
+    """
+
     if not db_pool:
-        return None
+        raise RuntimeError(
+            "База данных не подключена"
+        )
 
     await upsert_user(
         user
@@ -1405,9 +1476,22 @@ async def save_order_to_database(
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
+            sequence_number = await conn.fetchval(
+                """
+                SELECT nextval(
+                    'sm_order_number_seq'
+                )
+                """
+            )
+
+            order_number = (
+                f"SM-{int(sequence_number)}"
+            )
+
             order_id = await conn.fetchval(
                 """
                 INSERT INTO orders (
+                    order_number,
                     telegram_id,
                     customer_name,
                     phone,
@@ -1425,12 +1509,13 @@ async def save_order_to_database(
                     comment
                 )
                 VALUES (
-                    $1,$2,$3,$4,$5,
-                    $6,$7,$8,$9,$10,
-                    $11,$12,$13,$14,$15
+                    $1,$2,$3,$4,$5,$6,
+                    $7,$8,$9,$10,$11,
+                    $12,$13,$14,$15,$16
                 )
                 RETURNING id
                 """,
+                order_number,
                 user.id,
                 safe_str(
                     data.get("name")
@@ -1506,8 +1591,9 @@ async def save_order_to_database(
                     ],
                 )
 
-    return int(
-        order_id
+    return (
+        int(order_id),
+        order_number,
     )
 
 
@@ -4160,18 +4246,29 @@ async def handle_order(
         total,
     )
 
+    order_number = ""
+
     try:
-        saved_order_id = (
-            await save_order_to_database(
-                user,
-                data,
-                order_items,
-            )
+        (
+            saved_order_id,
+            order_number,
+        ) = await save_order_to_database(
+            user,
+            data,
+            order_items,
         )
 
+        data[
+            "order_number"
+        ] = order_number
+
         logger.info(
-            "Заказ сохранён в БД, id=%s",
+            (
+                "Заказ сохранён в БД: "
+                "id=%s order_number=%s"
+            ),
             saved_order_id,
+            order_number,
         )
 
     except Exception:
@@ -4179,12 +4276,38 @@ async def handle_order(
             "Не удалось сохранить заказ в БД"
         )
 
+        await message.answer(
+            (
+                "⚠️ Не удалось зарегистрировать заказ. "
+                "Пожалуйста, отправьте его повторно."
+            ),
+            reply_markup=start_keyboard(
+                user
+            ),
+        )
+
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    "⚠️ Ошибка регистрации заказа.\n"
+                    f"Telegram ID клиента: {client_id}\n"
+                    "Номер заказа не присвоен."
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось сообщить менеджеру об ошибке заказа"
+            )
+
+        return
+
     # --------------------------------------------------------
     # СООБЩЕНИЕ КЛИЕНТУ
     # --------------------------------------------------------
 
     client_text = (
-        "📦 Ваш заказ принят!\n\n"
+        f"📦 Ваш заказ {order_number} принят!\n\n"
 
         f"Имя: "
         f"{data.get('name') or username}\n"
@@ -4258,7 +4381,10 @@ async def handle_order(
     )
 
     admin_text = (
-        "✅ <b>Новый заказ</b>\n"
+        f"✅ <b>Новый заказ {order_number}</b>\n"
+
+        f"• <i>Номер:</i> "
+        f"<code>{order_number}</code>\n"
 
         f"• <i>Пользователь:</i> "
         f"{html.escape(username)}\n"
@@ -4334,6 +4460,21 @@ async def handle_order(
     # --------------------------------------------------------
 
     print_payload = {
+        # Единственный номер заказа.
+        # Чековая программа должна принять его,
+        # сохранить и напечатать без собственного подсчёта.
+        "order_number":
+            order_number,
+
+        "orderNumber":
+            order_number,
+
+        "order_no":
+            order_number,
+
+        "orderNo":
+            order_number,
+
         "name": customer_name,
 
         "phone": phone,
@@ -4413,12 +4554,16 @@ async def handle_order(
     logger.info(
         (
             "PRINT PAYLOAD: "
+            "order_number=%s "
             "discount_percent=%s "
             "discount_amount=%s "
             "items_total=%s "
             "delivery=%s "
             "total=%s"
         ),
+        print_payload[
+            "order_number"
+        ],
         print_payload[
             "discount_percent"
         ],
