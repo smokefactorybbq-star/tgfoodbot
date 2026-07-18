@@ -1744,9 +1744,6 @@ async def save_order_to_database(
                 items_total,
                 discount_percent,
                 discount_amount,
-                bonus_used,
-                cashback_percent,
-                cashback_earned,
                 total,
                 safe_str(
                     data.get(
@@ -1834,6 +1831,9 @@ async def build_print_payload_from_database(
                 items_total,
                 discount_percent,
                 discount_amount,
+                bonus_used,
+                cashback_percent,
+                cashback_earned,
                 total,
                 order_when,
                 order_date,
@@ -4824,8 +4824,9 @@ async def handle_order(
 
         await message.answer(
             (
-                "⚠️ Не удалось зарегистрировать заказ. "
-                "Пожалуйста, отправьте его повторно."
+                "⚠️ Произошла внутренняя ошибка сохранения заказа. "
+                "Менеджер уже получил уведомление и свяжется с вами. "
+                "Повторно оформлять заказ не нужно."
             ),
             reply_markup=start_keyboard(
                 user
@@ -4836,9 +4837,17 @@ async def handle_order(
             await bot.send_message(
                 ADMIN_CHAT_ID,
                 (
-                    "⚠️ Ошибка регистрации заказа.\n"
+                    "🚨 ЗАКАЗ НЕ СОХРАНИЛСЯ В БАЗУ, "
+                    "НО ЕГО НУЖНО ОБРАБОТАТЬ ВРУЧНУЮ!\n\n"
                     f"Telegram ID клиента: {client_id}\n"
-                    "Номер заказа не присвоен."
+                    f"Имя: {data.get('name') or username}\n"
+                    f"Телефон: {phone}\n"
+                    f"Адрес: {address}\n"
+                    f"Оплата: {pay_method}\n"
+                    f"Доставка: {delivery} ฿\n"
+                    f"Состав заказа:\n{items_text}\n\n"
+                    f"Предварительный итог: {total} ฿\n\n"
+                    "Клиенту сообщено, что повторять заказ не нужно."
                 ),
             )
         except Exception:
@@ -5244,15 +5253,31 @@ async def handle_order(
             print_response[:500],
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception(
             (
-                "Print send error. "
-                "Заказ сохранён в базе; "
-                "его можно дослать кнопкой "
-                "«🧾 Отправить чек»."
+                "PRINT DELIVERY FAILED (NON-FATAL). "
+                "Заказ уже сохранён в базе и отправлен менеджеру. "
+                "Чек можно дослать кнопкой «🧾 Отправить чек»."
             )
         )
+
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    f"⚠️ Заказ {order_number} принят, "
+                    "но чековая программа сейчас недоступна.\n\n"
+                    "Заказ НЕ потерян. Нажмите кнопку "
+                    "«🧾 Отправить чек» под заказом после "
+                    "восстановления связи.\n\n"
+                    f"Ошибка: {safe_str(exc)[:500]}"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось отправить менеджеру предупреждение о печати"
+            )
 
 
 # ============================================================================
