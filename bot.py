@@ -509,6 +509,42 @@ async def init_database() -> None:
             $order_number_sequence$;
 
 
+            /*
+             * Строгий счётчик чеков без пропусков.
+             *
+             * В отличие от PostgreSQL SEQUENCE, эта строка обновляется
+             * внутри обычной транзакции и откатывается при ошибке.
+             */
+            CREATE TABLE IF NOT EXISTS receipt_counter (
+                id SMALLINT PRIMARY KEY
+                    CHECK (id = 1),
+                last_number BIGINT NOT NULL
+            );
+
+
+            INSERT INTO receipt_counter (
+                id,
+                last_number
+            )
+            SELECT
+                1,
+                COALESCE(
+                    MAX(
+                        CASE
+                            WHEN order_number ~ '^SM-[0-9]+$'
+                            THEN SUBSTRING(
+                                order_number FROM 4
+                            )::BIGINT
+                            ELSE NULL
+                        END
+                    ),
+                    471
+                )
+            FROM orders
+            WHERE COALESCE(status, 'created') <> 'cancelled'
+            ON CONFLICT (id) DO NOTHING;
+
+
             CREATE INDEX IF NOT EXISTS idx_orders_created_at
             ON orders(created_at);
 
@@ -1530,30 +1566,78 @@ async def update_saved_order_loyalty(
     cashback_earned: int,
     final_total: int,
     loyalty_request_id: str,
-) -> None:
+) -> str:
+    """
+    Финализирует заказ и назначает номер чека строго по порядку.
+
+    Счётчик receipt_counter обновляется в той же транзакции,
+    что и заказ. Если транзакция завершится ошибкой, увеличение
+    номера откатится — пропуска не будет.
+    """
     if not db_pool:
         raise RuntimeError("База данных не подключена")
 
-    await db_pool.execute(
-        """
-        UPDATE orders
-        SET
-            discount_percent = 0,
-            discount_amount = $2,
-            bonus_used = $2,
-            cashback_percent = $3,
-            cashback_earned = $4,
-            total = $5,
-            loyalty_request_id = $6
-        WHERE id = $1
-        """,
-        order_id,
-        bonus_used,
-        cashback_percent,
-        cashback_earned,
-        final_total,
-        loyalty_request_id,
-    )
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            existing_number = await conn.fetchval(
+                """
+                SELECT order_number
+                FROM orders
+                WHERE id = $1
+                FOR UPDATE
+                """,
+                order_id,
+            )
+
+            if existing_number:
+                order_number = str(existing_number)
+
+            else:
+                next_number = await conn.fetchval(
+                    """
+                    UPDATE receipt_counter
+                    SET last_number = last_number + 1
+                    WHERE id = 1
+                    RETURNING last_number
+                    """
+                )
+
+                if next_number is None:
+                    raise RuntimeError(
+                        "Счётчик чеков не инициализирован"
+                    )
+
+                order_number = f"SM-{int(next_number)}"
+
+            result = await conn.execute(
+                """
+                UPDATE orders
+                SET
+                    order_number = $2,
+                    discount_percent = 0,
+                    discount_amount = $3,
+                    bonus_used = $3,
+                    cashback_percent = $4,
+                    cashback_earned = $5,
+                    total = $6,
+                    loyalty_request_id = $7
+                WHERE id = $1
+                """,
+                order_id,
+                order_number,
+                bonus_used,
+                cashback_percent,
+                cashback_earned,
+                final_total,
+                loyalty_request_id,
+            )
+
+            if result != "UPDATE 1":
+                raise RuntimeError(
+                    "Заказ не найден при финализации"
+                )
+
+    return order_number
 
 
 async def cancel_saved_order(order_id: int) -> None:
@@ -1574,11 +1658,11 @@ async def save_order_to_database(
     order_items: list[dict],
 ) -> tuple[int, str]:
     """
-    Сохраняет заказ и атомарно получает следующий номер SM-*.
+    Сохраняет черновик заказа без номера чека.
 
-    PostgreSQL sequence гарантирует, что два одновременных
-    заказа не получат один номер. После перезапуска Railway
-    счётчик продолжает работу с последнего значения.
+    Номер SM-* назначается только после успешного расчёта
+    бонусов функцией update_saved_order_loyalty(). Поэтому
+    отменённые и незавершённые заказы номера не занимают.
     """
 
     if not db_pool:
@@ -1679,17 +1763,7 @@ async def save_order_to_database(
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            sequence_number = await conn.fetchval(
-                """
-                SELECT nextval(
-                    'sm_order_number_seq'
-                )
-                """
-            )
-
-            order_number = (
-                f"SM-{int(sequence_number)}"
-            )
+            order_number = ""
 
             order_id = await conn.fetchval(
                 """
@@ -1718,7 +1792,7 @@ async def save_order_to_database(
                 )
                 RETURNING id
                 """,
-                order_number,
+                None,
                 user.id,
                 safe_str(
                     data.get("name")
@@ -4797,7 +4871,6 @@ async def handle_order(
     try:
         (
             saved_order_id,
-            order_number,
         ) = await save_order_to_database(
             user,
             data,
@@ -4810,8 +4883,8 @@ async def handle_order(
 
         logger.info(
             (
-                "Заказ сохранён в БД: "
-                "id=%s order_number=%s"
+                "Черновик заказа сохранён в БД: "
+                "id=%s; номер будет назначен после бонусов"
             ),
             saved_order_id,
             order_number,
@@ -4904,13 +4977,23 @@ async def handle_order(
         data["discount"] = bonus_used
         data["total"] = total
 
-        await update_saved_order_loyalty(
+        order_number = await update_saved_order_loyalty(
             saved_order_id,
             bonus_used,
             cashback_percent,
             cashback_earned,
             total,
             order_request_id,
+        )
+
+        data[
+            "order_number"
+        ] = order_number
+
+        logger.info(
+            "Заказ финализирован: id=%s order_number=%s",
+            saved_order_id,
+            order_number,
         )
 
     except Exception:
