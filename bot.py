@@ -1220,6 +1220,7 @@ def make_user_from_database(
 
 def build_admin_kb_full(
     client_id: int,
+    order_id: int,
 ) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
 
@@ -1235,6 +1236,13 @@ def build_admin_kb_full(
         ),
     )
 
+    kb.button(
+        text="🧾 Отправить чек",
+        callback_data=(
+            f"resend_receipt:{order_id}"
+        ),
+    )
+
     kb.adjust(1)
 
     return kb.as_markup()
@@ -1242,6 +1250,7 @@ def build_admin_kb_full(
 
 def build_admin_kb_safe(
     client_id: int,
+    order_id: int,
 ) -> types.InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
 
@@ -1252,10 +1261,16 @@ def build_admin_kb_safe(
         ),
     )
 
+    kb.button(
+        text="🧾 Отправить чек",
+        callback_data=(
+            f"resend_receipt:{order_id}"
+        ),
+    )
+
     kb.adjust(1)
 
     return kb.as_markup()
-
 
 def build_unsubscribe_keyboard(
 ) -> types.InlineKeyboardMarkup:
@@ -1314,6 +1329,7 @@ def build_keyboard_update_confirm(
 async def send_order_to_admin(
     admin_text_html: str,
     client_id: int,
+    order_id: int,
 ) -> None:
     try:
         await bot.send_message(
@@ -1322,7 +1338,8 @@ async def send_order_to_admin(
             parse_mode="HTML",
             reply_markup=(
                 build_admin_kb_full(
-                    client_id
+                    client_id,
+                    order_id,
                 )
             ),
         )
@@ -1351,7 +1368,8 @@ async def send_order_to_admin(
                 parse_mode="HTML",
                 reply_markup=(
                     build_admin_kb_safe(
-                        client_id
+                        client_id,
+                        order_id,
                     )
                 ),
             )
@@ -1595,6 +1613,270 @@ async def save_order_to_database(
         int(order_id),
         order_number,
     )
+
+
+# ============================================================================
+# ОТПРАВКА / ПОВТОРНАЯ ОТПРАВКА ЧЕКА
+# ============================================================================
+
+async def build_print_payload_from_database(
+    order_id: int,
+) -> dict:
+    """
+    Восстанавливает полный payload заказа из PostgreSQL.
+    Используется кнопкой «Отправить чек», поэтому повторная отправка
+    работает даже после перезапуска Railway.
+    """
+    if not db_pool:
+        raise RuntimeError(
+            "База данных не подключена"
+        )
+
+    async with db_pool.acquire() as conn:
+        order_row = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                order_number,
+                customer_name,
+                phone,
+                address,
+                payment_method,
+                delivery_fee,
+                items_total,
+                discount_percent,
+                discount_amount,
+                total,
+                order_when,
+                order_date,
+                order_time,
+                comment,
+                created_at
+            FROM orders
+            WHERE id = $1
+            """,
+            order_id,
+        )
+
+        if not order_row:
+            raise LookupError(
+                "Заказ не найден в базе"
+            )
+
+        item_rows = await conn.fetch(
+            """
+            SELECT
+                item_name,
+                quantity,
+                unit_price,
+                image_url
+            FROM order_items
+            WHERE order_id = $1
+            ORDER BY id
+            """,
+            order_id,
+        )
+
+    order_number = safe_str(
+        order_row["order_number"]
+    )
+
+    comment = safe_str(
+        order_row["comment"]
+    )
+
+    items = [
+        {
+            "name": safe_str(
+                row["item_name"]
+            ),
+            "qty": max(
+                1,
+                safe_int(
+                    row["quantity"],
+                    1,
+                ),
+            ),
+            "price": max(
+                0,
+                safe_int(
+                    row["unit_price"],
+                    0,
+                ),
+            ),
+            "img": safe_str(
+                row["image_url"]
+            ),
+        }
+        for row in item_rows
+    ]
+
+    created_at = order_row[
+        "created_at"
+    ]
+
+    if created_at:
+        try:
+            created_at = created_at.astimezone(
+                TIMEZONE
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            created_at = safe_str(
+                created_at
+            )
+    else:
+        created_at = datetime.now(
+            TIMEZONE
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    order_time = safe_str(
+        order_row["order_time"]
+    )
+
+    return {
+        "order_number": order_number,
+        "orderNumber": order_number,
+        "order_no": order_number,
+        "orderNo": order_number,
+
+        "name": safe_str(
+            order_row["customer_name"]
+        ),
+        "phone": safe_str(
+            order_row["phone"]
+        ),
+        "address": safe_str(
+            order_row["address"]
+        ),
+        "delivery": max(
+            0,
+            safe_int(
+                order_row["delivery_fee"],
+                0,
+            ),
+        ),
+        "payment": safe_str(
+            order_row["payment_method"]
+        ),
+        "items": items,
+
+        "items_total": max(
+            0,
+            safe_int(
+                order_row["items_total"],
+                0,
+            ),
+        ),
+        "itemsTotal": max(
+            0,
+            safe_int(
+                order_row["items_total"],
+                0,
+            ),
+        ),
+        "subtotal": max(
+            0,
+            safe_int(
+                order_row["items_total"],
+                0,
+            ),
+        ),
+
+        "discount_percent": max(
+            0,
+            safe_int(
+                order_row["discount_percent"],
+                0,
+            ),
+        ),
+        "discountPercent": max(
+            0,
+            safe_int(
+                order_row["discount_percent"],
+                0,
+            ),
+        ),
+        "discount_amount": max(
+            0,
+            safe_int(
+                order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "discountAmount": max(
+            0,
+            safe_int(
+                order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "discount": max(
+            0,
+            safe_int(
+                order_row["discount_amount"],
+                0,
+            ),
+        ),
+
+        "total": max(
+            0,
+            safe_int(
+                order_row["total"],
+                0,
+            ),
+        ),
+        "date": created_at,
+        "order_time": order_time,
+        "order_when": safe_str(
+            order_row["order_when"]
+        ),
+
+        "comment": comment,
+        "comments": comment,
+        "comment_text": comment,
+        "note": comment,
+        "notes": comment,
+    }
+
+
+async def send_payload_to_receipt_program(
+    print_payload: dict,
+    timeout_seconds: int = 12,
+) -> tuple[int, str]:
+    """
+    Отправляет заказ в чековую программу.
+    Возвращает HTTP-код и текст ответа.
+    """
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_seconds
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+        async with session.post(
+            PRINT_URL,
+            json=print_payload,
+        ) as response:
+            response_text = await response.text()
+
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(
+                    (
+                        f"Чековая программа вернула HTTP "
+                        f"{response.status}: "
+                        f"{response_text[:500]}"
+                    )
+                )
+
+            return (
+                response.status,
+                response_text,
+            )
 
 
 # ============================================================================
@@ -3731,6 +4013,133 @@ async def callback_keyboard_update_cancel(
 
 
 # ============================================================================
+# РУЧНАЯ ПОВТОРНАЯ ОТПРАВКА ЧЕКА
+# ============================================================================
+
+@dp.callback_query(
+    F.data.startswith(
+        "resend_receipt:"
+    )
+)
+async def cb_resend_receipt(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Недостаточно прав",
+            show_alert=True,
+        )
+        return
+
+    try:
+        order_id = int(
+            call.data.split(
+                ":",
+                1,
+            )[1]
+        )
+    except Exception:
+        await call.answer(
+            "Ошибка номера заказа",
+            show_alert=True,
+        )
+        return
+
+    # Сразу отвечаем Telegram, чтобы кнопка не зависла.
+    await call.answer(
+        "Отправляю чек…"
+    )
+
+    status_message = await call.message.answer(
+        "⏳ Восстанавливаю заказ из базы и отправляю в чековую программу…"
+    )
+
+    try:
+        print_payload = await build_print_payload_from_database(
+            order_id
+        )
+
+        status_code, response_text = (
+            await send_payload_to_receipt_program(
+                print_payload,
+                timeout_seconds=15,
+            )
+        )
+
+        order_number = safe_str(
+            print_payload.get(
+                "order_number"
+            )
+        )
+
+        await status_message.edit_text(
+            (
+                f"✅ Чек заказа {order_number} "
+                "успешно отправлен в чековую программу.\n\n"
+                f"HTTP: {status_code}\n"
+                f"Ответ: {response_text[:300] or 'OK'}"
+            )
+        )
+
+        logger.info(
+            (
+                "MANUAL PRINT SUCCESS: "
+                "order_id=%s order_number=%s response=%s"
+            ),
+            order_id,
+            order_number,
+            response_text[:500],
+        )
+
+    except asyncio.TimeoutError:
+        await status_message.edit_text(
+            (
+                "❌ Чек не отправлен: чековая программа "
+                "не ответила вовремя.\n\n"
+                "Проверьте интернет, ngrok и запущена ли программа, "
+                "затем нажмите «🧾 Отправить чек» ещё раз."
+            )
+        )
+
+        logger.exception(
+            "MANUAL PRINT TIMEOUT: order_id=%s",
+            order_id,
+        )
+
+    except aiohttp.ClientError as exc:
+        await status_message.edit_text(
+            (
+                "❌ Не удалось подключиться к чековой программе.\n\n"
+                f"Ошибка: {exc}\n\n"
+                "Проверьте PRINT_URL, ngrok и интернет, "
+                "затем нажмите кнопку ещё раз."
+            )
+        )
+
+        logger.exception(
+            "MANUAL PRINT NETWORK ERROR: order_id=%s",
+            order_id,
+        )
+
+    except Exception as exc:
+        await status_message.edit_text(
+            (
+                "❌ Чек не отправлен.\n\n"
+                f"Ошибка: {exc}\n\n"
+                "После восстановления связи нажмите "
+                "«🧾 Отправить чек» ещё раз."
+            )
+        )
+
+        logger.exception(
+            "MANUAL PRINT ERROR: order_id=%s",
+            order_id,
+        )
+
+
+# ============================================================================
 # ОТВЕТ МЕНЕДЖЕРА КЛИЕНТУ
 # ============================================================================
 
@@ -4445,6 +4854,7 @@ async def handle_order(
         await send_order_to_admin(
             admin_text,
             client_id,
+            saved_order_id,
         )
 
     except Exception:
@@ -4582,43 +4992,31 @@ async def handle_order(
     )
 
     try:
-        timeout = aiohttp.ClientTimeout(
-            total=7
+        (
+            print_status,
+            print_response,
+        ) = await send_payload_to_receipt_program(
+            print_payload,
+            timeout_seconds=7,
         )
 
-        async with aiohttp.ClientSession(
-            timeout=timeout
-        ) as session:
-            async with session.post(
-                PRINT_URL,
-                json=print_payload,
-            ) as response:
-                response_text = (
-                    await response.text()
-                )
-
-                if response.status == 200:
-                    logger.info(
-                        (
-                            "Печать отправлена. "
-                            "Ответ чековой программы: %s"
-                        ),
-                        response_text[:500],
-                    )
-
-                else:
-                    logger.error(
-                        (
-                            "Ошибка печати: "
-                            "HTTP %s, ответ: %s"
-                        ),
-                        response.status,
-                        response_text[:500],
-                    )
+        logger.info(
+            (
+                "Печать отправлена: "
+                "HTTP %s, ответ: %s"
+            ),
+            print_status,
+            print_response[:500],
+        )
 
     except Exception:
         logger.exception(
-            "Print send error"
+            (
+                "Print send error. "
+                "Заказ сохранён в базе; "
+                "его можно дослать кнопкой "
+                "«🧾 Отправить чек»."
+            )
         )
 
 
