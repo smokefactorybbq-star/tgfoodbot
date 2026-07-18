@@ -4809,7 +4809,6 @@ async def handle_order(
     try:
         (
             saved_order_id,
-            order_number,
         ) = await save_order_to_database(
             user,
             data,
