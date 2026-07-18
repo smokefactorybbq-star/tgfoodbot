@@ -5093,7 +5093,6 @@ async def handle_order(
             admin_text,
             client_id,
             saved_order_id,
-            order_number,
         )
 
     except Exception:
