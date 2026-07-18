@@ -112,6 +112,8 @@ MENU_BTN_TEXT = "📋 Открыть меню"
 ASK_BTN_TEXT = "💬 Задать вопрос менеджеру"
 
 
+LOYALTY_SETTLE_URL = f"{WEBAPP_URL}/api/loyalty/settle"
+
 PRINT_URL = os.getenv(
     "PRINT_URL",
     "https://6b6b-171-6-244-48.ngrok-free.app/order",
@@ -170,6 +172,54 @@ db_pool: asyncpg.Pool | None = None
 TIMEZONE = ZoneInfo(
     "Asia/Bangkok"
 )
+
+MENU_PRICE_MAP: dict[str, int] = {
+    "Борщ": 180,
+    "Солянка": 180,
+    "Гороховый суп": 180,
+    "Грибной суп": 180,
+    "Окрошка": 180,
+    "Куриный суп": 150,
+    "Котлеты куриные": 150,
+    "Вареники с картошкой и беконом": 170,
+    "Пельмени": 190,
+    "Котлеты из домашнего фарша": 180,
+    "Перец фаршированный": 200,
+    "Бефстроганов": 220,
+    "Лепешка с сыром": 100,
+    "Лепешка с картошкой": 100,
+    "Лепешка с рваной свининой": 150,
+    "Котлета по-киевски": 230,
+    "Зраза": 200,
+    "Драники": 200,
+    "Ленивые голубцы Том ям": 250,
+    "Картошка фри": 120,
+    "Картошка дольками": 120,
+    "Мини чебуреки": 170,
+    "Салат Цезарь с копченой курицей": 180,
+    "Салат Обжорка": 180,
+    "Салат Крабовый": 170,
+    "Салат баклажаны в кляре": 160,
+    "Салат Деревенский": 180,
+    "Салат Столичный": 160,
+    "Ребра BBQ": 350,
+    "Кебаб свинина-говядина": 250,
+    "Кебаб из курицы": 200,
+    "Шашлык из курицы": 200,
+    "Шашлык из курицы 2.0": 250,
+    "Шашлык из куриного крыла": 240,
+    "Шашлык из свинины": 250,
+    "Ребро варено-копченое": 300,
+    "Лепешка с мясом (Standart)": 100,
+    "Лепешка с мясом (XXL)": 180,
+    "Лепешка с сыром (Standart)": 100,
+    "Лепешка с сыром (XXL)": 200,
+    "Лепешка с картошкой (Standart)": 100,
+    "Лепешка с картошкой (XXL)": 200,
+    "Лепешка с рваной свининой (Standart)": 140,
+    "Лепешка с рваной свининой (XXL)": 250
+}
+MAX_BONUS_REDEEM_PERCENT = 20
 
 
 # ============================================================================
@@ -392,6 +442,18 @@ async def init_database() -> None:
              */
             ALTER TABLE orders
             ADD COLUMN IF NOT EXISTS order_number TEXT;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS bonus_used INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS cashback_percent INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS cashback_earned INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS loyalty_request_id TEXT;
 
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_number
@@ -1380,6 +1442,129 @@ async def send_order_to_admin(
 
 
 # ============================================================================
+# ЗАЩИЩЁННАЯ СИСТЕМА ЛОЯЛЬНОСТИ
+# ============================================================================
+
+def make_loyalty_signature_payload(
+    telegram_id: int,
+    order_ref: str,
+    items_total: int,
+    delivery: int,
+    requested_bonus: int,
+    timestamp: int,
+) -> str:
+    return "|".join(
+        [
+            str(telegram_id),
+            str(order_ref),
+            str(items_total),
+            str(delivery),
+            str(requested_bonus),
+            str(timestamp),
+        ]
+    )
+
+
+async def settle_loyalty_order(
+    telegram_id: int,
+    order_ref: str,
+    items_total: int,
+    delivery: int,
+    requested_bonus: int,
+) -> dict:
+    timestamp = int(time.time())
+    body = {
+        "telegramId": str(telegram_id),
+        "orderRef": str(order_ref),
+        "itemsTotal": int(items_total),
+        "delivery": int(delivery),
+        "requestedBonus": int(requested_bonus),
+    }
+
+    signature_payload = make_loyalty_signature_payload(
+        telegram_id,
+        order_ref,
+        items_total,
+        delivery,
+        requested_bonus,
+        timestamp,
+    )
+
+    signature = hmac.new(
+        API_TOKEN.encode("utf-8"),
+        signature_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            LOYALTY_SETTLE_URL,
+            json=body,
+            headers={
+                "X-Loyalty-Timestamp": str(timestamp),
+                "X-Loyalty-Signature": signature,
+            },
+        ) as response:
+            raw = await response.text()
+
+            try:
+                result = json.loads(raw)
+            except Exception:
+                result = {"ok": False, "error": raw[:500]}
+
+            if response.status != 200 or not result.get("ok"):
+                raise RuntimeError(
+                    result.get("error")
+                    or f"Loyalty HTTP {response.status}"
+                )
+
+            return result
+
+
+async def update_saved_order_loyalty(
+    order_id: int,
+    bonus_used: int,
+    cashback_percent: int,
+    cashback_earned: int,
+    final_total: int,
+    loyalty_request_id: str,
+) -> None:
+    if not db_pool:
+        raise RuntimeError("База данных не подключена")
+
+    await db_pool.execute(
+        """
+        UPDATE orders
+        SET
+            discount_percent = 0,
+            discount_amount = $2,
+            bonus_used = $2,
+            cashback_percent = $3,
+            cashback_earned = $4,
+            total = $5,
+            loyalty_request_id = $6
+        WHERE id = $1
+        """,
+        order_id,
+        bonus_used,
+        cashback_percent,
+        cashback_earned,
+        final_total,
+        loyalty_request_id,
+    )
+
+
+async def cancel_saved_order(order_id: int) -> None:
+    if db_pool:
+        await db_pool.execute(
+            "UPDATE orders SET status='cancelled' WHERE id=$1",
+            order_id,
+        )
+
+
+# ============================================================================
 # СОХРАНЕНИЕ ЗАКАЗА В БАЗУ
 # ============================================================================
 
@@ -1559,6 +1744,9 @@ async def save_order_to_database(
                 items_total,
                 discount_percent,
                 discount_amount,
+                bonus_used,
+                cashback_percent,
+                cashback_earned,
                 total,
                 safe_str(
                     data.get(
@@ -1817,9 +2005,31 @@ async def build_print_payload_from_database(
         "discount": max(
             0,
             safe_int(
-                order_row["discount_amount"],
+                order_row["bonus_used"] or order_row["discount_amount"],
                 0,
             ),
+        ),
+        "bonus_used": max(
+            0,
+            safe_int(
+                order_row["bonus_used"] or order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "used_bonuses": max(
+            0,
+            safe_int(
+                order_row["bonus_used"] or order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "cashback_percent": max(
+            0,
+            safe_int(order_row["cashback_percent"], 0),
+        ),
+        "cashback_earned": max(
+            0,
+            safe_int(order_row["cashback_earned"], 0),
         ),
 
         "total": max(
@@ -4341,39 +4551,22 @@ async def handle_order(
         ),
     )
 
-    discount_percent = max(
-        0,
-        min(
-            100,
-            safe_int(
-                data.get(
-                    "discountPercent",
-                    data.get(
-                        "discount_percent",
-                        0,
-                    ),
-                ),
-                0,
-            ),
-        ),
-    )
-
-    discount_amount = max(
+    requested_bonus = max(
         0,
         safe_int(
             data.get(
-                "discountAmount",
+                "bonusRequested",
                 data.get(
-                    "discount_amount",
-                    data.get(
-                        "discount",
-                        0,
-                    ),
+                    "bonus_requested",
+                    data.get("discountAmount", 0),
                 ),
             ),
             0,
         ),
     )
+
+    discount_percent = 0
+    discount_amount = 0
 
     items = (
         data.get(
@@ -4482,60 +4675,63 @@ async def handle_order(
         dict
     ] = []
 
-    for name, info in items.items():
-        if not isinstance(
-            info,
-            dict,
-        ):
+    for raw_name, info in items.items():
+        if not isinstance(info, dict):
             continue
 
-        qty = max(
-            0,
-            safe_int(
-                info.get(
-                    "qty",
-                    0,
-                ),
-                0,
-            ),
-        )
+        name = safe_str(raw_name, "").strip()
 
-        price = max(
-            0,
-            safe_int(
-                info.get(
-                    "price",
-                    0,
-                ),
-                0,
-            ),
-        )
-
-        item_sum = (
-            qty * price
-        )
-
-        lines.append(
-            (
-                f"- {name} ×{qty} "
-                f"= {item_sum} ฿"
+        if name not in MENU_PRICE_MAP:
+            logger.warning(
+                "ORDER REJECTED: unknown item=%r user=%s",
+                name,
+                client_id,
             )
+            await message.answer(
+                (
+                    "⚠️ В заказе обнаружено неизвестное блюдо. "
+                    "Обновите меню и оформите заказ заново."
+                ),
+                reply_markup=start_keyboard(user),
+            )
+            return
+
+        qty = safe_int(info.get("qty", 0), 0)
+
+        if qty < 1 or qty > 50:
+            await message.answer(
+                "⚠️ Некорректное количество блюда.",
+                reply_markup=start_keyboard(user),
+            )
+            return
+
+        authoritative_price = int(MENU_PRICE_MAP[name])
+        client_price = safe_int(
+            info.get("price", authoritative_price),
+            authoritative_price,
         )
+
+        if client_price != authoritative_price:
+            logger.warning(
+                (
+                    "PRICE TAMPERING BLOCKED: "
+                    "user=%s item=%r client=%s server=%s"
+                ),
+                client_id,
+                name,
+                client_price,
+                authoritative_price,
+            )
+
+        item_sum = qty * authoritative_price
+        lines.append(f"- {name} ×{qty} = {item_sum} ฿")
 
         order_items.append(
             {
-                "name": safe_str(
-                    name,
-                    "",
-                ),
+                "name": name,
                 "qty": qty,
-                "price": price,
-                "img": safe_str(
-                    info.get(
-                        "img"
-                    ),
-                    "",
-                ),
+                "price": authoritative_price,
+                "img": safe_str(info.get("img"), ""),
             }
         )
 
@@ -4571,89 +4767,30 @@ async def handle_order(
         in order_items
     )
 
-    if (
-        discount_percent > 0
-        and discount_amount <= 0
-    ):
-        discount_amount = int(
-            items_total
-            * discount_percent
-            / 100
-        )
-
-    discount_amount = min(
-        discount_amount,
-        items_total,
+    max_requested_by_order = int(
+        items_total * MAX_BONUS_REDEEM_PERCENT / 100
     )
+    requested_bonus = min(requested_bonus, max_requested_by_order)
 
-    if (
-        discount_amount > 0
-        and discount_percent <= 0
-        and items_total > 0
-    ):
-        discount_percent = round(
-            discount_amount
-            / items_total
-            * 100
-        )
+    total = items_total + delivery
 
-    total = max(
-        0,
-        items_total
-        - discount_amount
-        + delivery,
-    )
+    data["itemsTotal"] = items_total
+    data["items_total"] = items_total
+    data["bonusRequested"] = requested_bonus
+    data["bonus_requested"] = requested_bonus
+    data["discountPercent"] = 0
+    data["discount_percent"] = 0
+    data["discountAmount"] = 0
+    data["discount_amount"] = 0
+    data["discount"] = 0
+    data["total"] = total
 
-    # Нормализуем данные,
-    # чтобы база, сообщения и печать
-    # получили одинаковые значения.
-    data[
-        "itemsTotal"
-    ] = items_total
-
-    data[
-        "items_total"
-    ] = items_total
-
-    data[
-        "discountPercent"
-    ] = discount_percent
-
-    data[
-        "discount_percent"
-    ] = discount_percent
-
-    data[
-        "discountAmount"
-    ] = discount_amount
-
-    data[
-        "discount_amount"
-    ] = discount_amount
-
-    data[
-        "discount"
-    ] = discount_amount
-
-    data[
-        "total"
-    ] = total
-
-    logger.info(
-        (
-            "ORDER TOTALS: "
-            "items_total=%s "
-            "discount_percent=%s "
-            "discount_amount=%s "
-            "delivery=%s "
-            "total=%s"
-        ),
-        items_total,
-        discount_percent,
-        discount_amount,
-        delivery,
-        total,
-    )
+    order_request_id = safe_str(
+        data.get("orderRequestId")
+        or data.get("order_request_id")
+        or f"tg-{client_id}-{message.message_id}",
+        f"tg-{client_id}-{message.message_id}",
+    )[:160]
 
     order_number = ""
 
@@ -4711,6 +4848,76 @@ async def handle_order(
 
         return
 
+    try:
+        loyalty_result = await settle_loyalty_order(
+            telegram_id=client_id,
+            order_ref=order_request_id,
+            items_total=items_total,
+            delivery=delivery,
+            requested_bonus=requested_bonus,
+        )
+
+        bonus_used = max(0, safe_int(loyalty_result.get("bonusUsed"), 0))
+        cashback_percent = max(
+            0,
+            min(100, safe_int(loyalty_result.get("cashbackPercent"), 0)),
+        )
+        cashback_earned = max(
+            0,
+            safe_int(loyalty_result.get("cashbackEarned"), 0),
+        )
+        bonus_balance_after = max(
+            0,
+            safe_int(loyalty_result.get("balanceAfter"), 0),
+        )
+        total = max(
+            0,
+            safe_int(
+                loyalty_result.get("total"),
+                items_total - bonus_used + delivery,
+            ),
+        )
+
+        discount_percent = 0
+        discount_amount = bonus_used
+
+        data["bonusUsed"] = bonus_used
+        data["bonus_used"] = bonus_used
+        data["cashbackPercent"] = cashback_percent
+        data["cashback_percent"] = cashback_percent
+        data["cashbackEarned"] = cashback_earned
+        data["cashback_earned"] = cashback_earned
+        data["bonusBalanceAfter"] = bonus_balance_after
+        data["discountPercent"] = 0
+        data["discount_percent"] = 0
+        data["discountAmount"] = bonus_used
+        data["discount_amount"] = bonus_used
+        data["discount"] = bonus_used
+        data["total"] = total
+
+        await update_saved_order_loyalty(
+            saved_order_id,
+            bonus_used,
+            cashback_percent,
+            cashback_earned,
+            total,
+            order_request_id,
+        )
+
+    except Exception:
+        logger.exception("LOYALTY SETTLEMENT ERROR")
+        await cancel_saved_order(saved_order_id)
+
+        await message.answer(
+            (
+                "⚠️ Не удалось безопасно рассчитать бонусы. "
+                "Деньги не списаны, заказ отменён. "
+                "Попробуйте оформить заказ ещё раз."
+            ),
+            reply_markup=start_keyboard(user),
+        )
+        return
+
     # --------------------------------------------------------
     # СООБЩЕНИЕ КЛИЕНТУ
     # --------------------------------------------------------
@@ -4752,11 +4959,16 @@ async def handle_order(
         f"{items_total} ฿\n"
     )
 
-    if discount_amount > 0:
+    if bonus_used > 0:
         client_text += (
-            f"Скидка "
-            f"{discount_percent}%: "
-            f"-{discount_amount} ฿\n"
+            f"Использовано бонусов: -{bonus_used} ฿\n"
+        )
+
+    if cashback_earned > 0:
+        client_text += (
+            f"Начислено кэшбэка {cashback_percent}%: "
+            f"+{cashback_earned} ฿\n"
+            f"Бонусный баланс: {bonus_balance_after} ฿\n"
         )
 
     client_text += (
@@ -4835,11 +5047,16 @@ async def handle_order(
         f"{items_total} ฿\n"
     )
 
-    if discount_amount > 0:
+    if bonus_used > 0:
         admin_text += (
-            f"• <i>Скидка:</i> "
-            f"{discount_percent}% "
-            f"(-{discount_amount} ฿)\n"
+            f"• <i>Использовано бонусов:</i> "
+            f"-{bonus_used} ฿\n"
+        )
+
+    if cashback_earned > 0:
+        admin_text += (
+            f"• <i>Начислено кэшбэка:</i> "
+            f"{cashback_percent}% (+{cashback_earned} ฿)\n"
         )
 
     admin_text += (
@@ -4923,9 +5140,27 @@ async def handle_order(
             discount_amount,
 
         "discount":
-            discount_amount,
+            bonus_used,
 
-        # Итог после скидки
+        "bonus_used":
+            bonus_used,
+
+        "bonusUsed":
+            bonus_used,
+
+        "used_bonuses":
+            bonus_used,
+
+        "cashback_percent":
+            cashback_percent,
+
+        "cashback_earned":
+            cashback_earned,
+
+        "bonus_balance_after":
+            bonus_balance_after,
+
+        # Итог после списания бонусов
         # и с доставкой.
         "total": total,
 
