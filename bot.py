@@ -103,7 +103,7 @@ MANAGER_URL = os.getenv(
 
 WEBAPP_URL = os.getenv(
     "WEBAPP_URL",
-    "https://aa34-171-6-239-0.ngrok-free.app",
+    "https://mini-app-production-67f2.up.railway.app",
 ).rstrip("/")
 
 
@@ -116,7 +116,7 @@ LOYALTY_SETTLE_URL = f"{WEBAPP_URL}/api/loyalty/settle"
 
 PRINT_URL = os.getenv(
     "PRINT_URL",
-    "https://84ae-171-6-239-0.ngrok-free.app",
+    "https://aa34-171-6-239-0.ngrok-free.app",
 )
 
 
