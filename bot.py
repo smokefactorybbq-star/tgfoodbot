@@ -103,7 +103,7 @@ MANAGER_URL = os.getenv(
 
 WEBAPP_URL = os.getenv(
     "WEBAPP_URL",
-    "https://mini-app-production-67f2.up.railway.app",
+    "https://aa34-171-6-239-0.ngrok-free.app",
 ).rstrip("/")
 
 
