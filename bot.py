@@ -116,7 +116,7 @@ LOYALTY_SETTLE_URL = f"{WEBAPP_URL}/api/loyalty/settle"
 
 PRINT_URL = os.getenv(
     "PRINT_URL",
-    "https://f810-171-6-240-180.ngrok-free.app/order",
+    "https://pseudosocially-tiddly-alysia.ngrok-free.dev/order",
 )
 
 
