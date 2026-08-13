@@ -2072,34 +2072,69 @@ async def send_payload_to_receipt_program(
 ) -> tuple[int, str]:
     """
     Отправляет заказ в чековую программу.
-    Возвращает HTTP-код и текст ответа.
+    При временной ошибке ngrok (502/503/504) или сети делает один повтор.
+    Повтор безопасен, потому что printer_gui.py не создаёт второй JSON
+    для уже принятого order_number.
     """
     timeout = aiohttp.ClientTimeout(
         total=timeout_seconds
     )
 
+    last_error: Exception | None = None
+
     async with aiohttp.ClientSession(
         timeout=timeout
     ) as session:
-        async with session.post(
-            PRINT_URL,
-            json=print_payload,
-        ) as response:
-            response_text = await response.text()
+        for attempt in range(2):
+            try:
+                async with session.post(
+                    PRINT_URL,
+                    json=print_payload,
+                ) as response:
+                    response_text = await response.text()
 
-            if response.status < 200 or response.status >= 300:
-                raise RuntimeError(
-                    (
-                        f"Чековая программа вернула HTTP "
-                        f"{response.status}: "
-                        f"{response_text[:500]}"
+                    if 200 <= response.status < 300:
+                        return (
+                            response.status,
+                            response_text,
+                        )
+
+                    error = RuntimeError(
+                        (
+                            f"Чековая программа вернула HTTP "
+                            f"{response.status}: "
+                            f"{response_text[:500]}"
+                        )
                     )
-                )
 
-            return (
-                response.status,
-                response_text,
-            )
+                    if response.status in (502, 503, 504) and attempt == 0:
+                        last_error = error
+                        logger.warning(
+                            "PRINT HTTP %s. Повторная отправка через 1 секунду.",
+                            response.status,
+                        )
+                        await asyncio.sleep(1)
+                        continue
+
+                    raise error
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = exc
+
+                if attempt == 0:
+                    logger.warning(
+                        "PRINT network error: %s. Повторная отправка через 1 секунду.",
+                        safe_str(exc),
+                    )
+                    await asyncio.sleep(1)
+                    continue
+
+                raise
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("Не удалось отправить заказ в чековую программу")
 
 
 # ============================================================================
