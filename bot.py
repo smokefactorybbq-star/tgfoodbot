@@ -1,1879 +1,5732 @@
-# -*- coding: utf-8 -*-
 import os
+import sys
+import csv
+import io
 import json
-import threading
+import time
+import hmac
+import html
+import base64
+import hashlib
+import logging
 import asyncio
-import queue
-import traceback
-import winsound
+import threading
+
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse
-import tkinter as tk
-from tkinter import messagebox, simpledialog
-import win32print
-import win32ui
-from PIL import Image, ImageWin, ImageDraw, ImageFont, ImageOps
-from datetime import datetime, date
-import calendar
-import re
-from pathlib import Path
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+from zoneinfo import ZoneInfo
 
-# NIIMBOT загружается мягко: даже если библиотека bleak ещё не установлена,
-# вся прежняя чековая программа продолжит запускаться и работать как раньше.
+import aiohttp
+import asyncpg
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
+from aiogram.enums import ContentType
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
+from aiogram.filters import Command
+from aiogram.types import BufferedInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
+# ============================================================================
+# ЛОГИРОВАНИЕ
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# НАСТРОЙКИ — ТВОИ ДАННЫЕ НЕ ИЗМЕНЕНЫ
+# ============================================================================
+
 try:
-    from niimbot_b1_ble import print_file as print_niimbot_file
-    NIIMBOT_IMPORT_ERROR = None
-except Exception as exc:
-    print_niimbot_file = None
-    NIIMBOT_IMPORT_ERROR = exc
+    from dotenv import load_dotenv
 
-# ===================== ПУТИ / НАСТРОЙКИ =====================
-BASE_DIR = Path(__file__).resolve().parent
-os.chdir(BASE_DIR)                            # фиксируем рабочую папку
-ORDERS_DIR = BASE_DIR / "orders"              # абсолютный путь к orders
-ORDERS_DIR.mkdir(exist_ok=True)
-SOUNDS_DIR = BASE_DIR / "sounds"
-ALARM_SOUND = SOUNDS_DIR / "new_order.wav"
-
-# ===================== СКРЫТАЯ GRAB-ПЕЧАТЬ =====================
-# Интерфейс программы не меняется. Второй бот отправляет только номер заказа
-# на /grab (или /grab-label), программа сохраняет его в папке GRAB и ставит
-# этикетку в очередь на автоматическую печать.
-GRAB_DIR = BASE_DIR / "GRAB"
-GRAB_DIR.mkdir(exist_ok=True)
-GRAB_TEMPLATE_PATH = BASE_DIR / "grab_template.png"
-GRAB_BLE_ADDRESS = "23:0a:05:7b:99:bc"
-GRAB_PRINT_DENSITY = 3
-GRAB_IMAGE_THRESHOLD = 145
-GRAB_LABEL_WIDTH = 384
-GRAB_LABEL_HEIGHT = 240
-GRAB_PRINT_QUEUE = queue.Queue()
+    load_dotenv()
+except Exception:
+    pass
 
 
-MAX_LINE_WIDTH = 48
-RECEIVER_HOST = "127.0.0.1"
-RECEIVER_PORT = 8000     # ngrok: https://... -> http://localhost:8000
+API_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# ===================== СЛОВАРИ =====================
-TRANSLATIONS = {
-    "Борщ": "Borscht",
-    "Солянка": "Solyanka",
-    "Гороховый суп": "Peas soup",
-    "Котлеты куриные": "Chicken cutlets",
-    "Вареники с картошкой и беконом": "Vareniki with potato and bacon",
-    "Пельмени": "Pelmeni",
-    "Котлеты из домашнего фарша": "Meat cutlets",
-    "Перец фаршированный": "Stuffed pepper",
-    "Тефтели": "Meatballs",
-    "Лепешка с сыром": "Cheese flatbread",
-    "Паста карбонара": "Pasta carbonara",
-    "Паста болоньезе": "Pasta Bolognese",
-    "Ребра BBQ": "BBQ ribs",
-    "Кебаб свинина-говядина": "Pork-beef kebab",
-    "Кебаб из курицы": "Chicken kebab",
-    "Шашлык из свинины": "Pork shashlik",
-    "Пельмени 1кг": "Pelmeni 1kg",
-    "Вареники 1кг": "Vareniki 1kg",
-    "Копченая шейка": "Smoked pork collar",
-    "Копченый бекон": "Smoked pork belly",
-    "Колбаса краковская": "Krakow sausage",
-    "Копченая курица": "Smoked chicken",
-    "Копченая корейка": "Smoked pork loin",
-    "Котлета по-киевски": "Cutlet Kiev",
-    "Лепешка с картошкой": "Potato flatbread",
-    "Салат Цезарь с копченой курицей": "Caesar salad",
-    "Салат с тунцом": "Tuna salad",
-    "Бефстроганов": "Beefstroganoff",
-    "Лепешка с мясом": "Meat flatbread",
-    "Картошка фри": "French fries",
-    "Картошка дольками": "Potato wedges",
-    "Мини чебуреки": "Mini Chebureki",
-    "Салат баклажаны в кляре": "Eggplant salad",
-    "Шашлык из курицы": "Chicken grill"
+if not API_TOKEN:
+    logger.critical("ERROR: TELEGRAM_BOT_TOKEN не установлен")
+    sys.exit(1)
+
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    logger.critical("ERROR: DATABASE_URL не установлен")
+    sys.exit(1)
+
+
+ADMIN_CHAT_ID = int(
+    os.getenv(
+        "ADMIN_CHAT_ID",
+        "7309681026",
+    )
+)
+
+RESTART_MINUTES = int(
+    os.getenv(
+        "RESTART_MINUTES",
+        "420",
+    )
+)
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "8080",
+    )
+)
+
+
+MANAGER_URL = os.getenv(
+    "MANAGER_URL",
+    "https://t.me/SmokefactoryBBQ",
+)
+
+
+WEBAPP_URL = os.getenv(
+    "WEBAPP_URL",
+    "https://mini-app-production-67f2.up.railway.app",
+).rstrip("/")
+
+
+MENU_BTN_TEXT = "📋 Открыть меню"
+
+ASK_BTN_TEXT = "💬 Задать вопрос менеджеру"
+
+
+LOYALTY_SETTLE_URL = f"{WEBAPP_URL}/api/loyalty/settle"
+
+PRINT_URL = os.getenv(
+    "PRINT_URL",
+    "https://pseudosocially-tiddly-alysia.ngrok-free.dev/order",
+)
+
+
+# ============================================================================
+# ИНИЦИАЛИЗАЦИЯ
+# ============================================================================
+
+bot = Bot(
+    token=API_TOKEN
+)
+
+dp = Dispatcher()
+
+
+KEYBOARD_SHOWN_USERS: set[int] = set()
+
+
+# Менеджер пишет клиенту.
+waiting_reply: dict[
+    int,
+    dict[str, int],
+] = {}
+
+
+# Менеджер готовит рекламную рассылку.
+waiting_broadcast: set[int] = set()
+
+
+# Подготовленное сообщение для рассылки.
+pending_broadcasts: dict[
+    int,
+    dict,
+] = {}
+
+
+# Состояние команды /bonus.
+waiting_bonus: dict[
+    int,
+    dict,
+] = {}
+
+
+broadcast_lock = asyncio.Lock()
+
+broadcast_running = False
+
+BROADCAST_DELAY = 0.06
+
+
+db_pool: asyncpg.Pool | None = None
+
+
+TIMEZONE = ZoneInfo(
+    "Asia/Bangkok"
+)
+
+MENU_PRICE_MAP: dict[str, int] = {
+    "Борщ": 180,
+    "Солянка": 180,
+    "Гороховый суп": 180,
+    "Грибной суп": 180,
+    "Окрошка": 180,
+    "Куриный суп": 150,
+    "Котлеты куриные": 150,
+    "Вареники с картошкой и беконом": 170,
+    "Пельмени": 190,
+    "Котлеты из домашнего фарша": 180,
+    "Перец фаршированный": 200,
+    "Бефстроганов": 220,
+    "Лепешка с сыром": 100,
+    "Лепешка с картошкой": 100,
+    "Лепешка с рваной свининой": 150,
+    "Котлета по-киевски": 230,
+    "Зраза": 200,
+    "Драники": 200,
+    "Ленивые голубцы Том ям": 250,
+    "Картошка фри": 120,
+    "Картошка дольками": 120,
+    "Мини чебуреки": 170,
+    "Салат Цезарь с копченой курицей": 180,
+    "Овощной салат": 120,
+    "Салат Обжорка": 180,
+    "Салат Крабовый": 170,
+    "Салат баклажаны в кляре": 160,
+    "Салат Деревенский": 180,
+    "Салат Столичный": 160,
+    "Ребра BBQ": 350,
+    "Кебаб свинина-говядина": 250,
+    "Кебаб из курицы": 200,
+    "Шашлык из курицы": 200,
+    "Шашлык из курицы 2.0": 250,
+    "Шашлык из куриного крыла": 240,
+    "Шашлык из свинины": 250,
+    "Ребро варено-копченое": 300,
+    "Лепешка с мясом (Standart)": 100,
+    "Лепешка с мясом (XXL)": 180,
+    "Лепешка с сыром (Standart)": 100,
+    "Лепешка с сыром (XXL)": 200,
+    "Лепешка с картошкой (Standart)": 100,
+    "Лепешка с картошкой (XXL)": 200,
+    "Лепешка с рваной свининой (Standart)": 140,
+    "Лепешка с рваной свининой (XXL)": 250
 }
-
-PAYMENT_MAP = {
-    "Банк РФ": "Cash",
-    "Thai bank": "PromptPay",
-}
-
-COMPANY_ADDRESS = "Address: 100/531 Village №5, Ratsada Subdistict, Mueang Phuket District, Phuket Province 83000"
-COMPANY_TAX_ID  = "TAX ID: 0835567035228"
-
-# ===================== УТИЛИТЫ =====================
-def wrap_text(text: str, width: int):
-    lines = []
-    for line in str(text or "").split("\n"):
-        while len(line) > width:
-            lines.append(line[:width])
-            line = line[width:]
-        lines.append(line)
-    return lines
-
-def _parse_dt_safe(s: str):
-    """Понимает даты из разных JSON и из разных имён файлов."""
-    s = str(s or "").strip()
-    if not s:
-        return None
-
-    # ISO-строки: 2025-06-30T20:13:55 или 2025-06-30 20:13:55
-    iso_s = s.replace("T", " ").split("+")[0].split("Z")[0].strip()
-
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%Y-%m-%d",
-        "%Y-%m-%d_%H-%M-%S",
-        "%Y-%m-%d_%H-%M",
-        "%Y%m%d-%H%M%S",
-        "%Y%m%d-%H%M",
-        "%Y%m%d",
-        "%d.%m.%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M",
-        "%d.%m.%Y",
-    ):
-        try:
-            return datetime.strptime(iso_s, fmt)
-        except Exception:
-            pass
-    return None
-
-def parse_dt_from_filename(filename: str):
-    """
-    Достаёт дату из имён файлов заказов:
-      20260629-202410.json
-      2025-06-30_20-13-55.json
-    """
-    stem = Path(filename).stem
-
-    patterns = [
-        r"(\d{8}-\d{6})",
-        r"(\d{8}-\d{4})",
-        r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})",
-        r"(\d{4}-\d{2}-\d{2}_\d{2}-\d{2})",
-        r"(\d{4}-\d{2}-\d{2})",
-        r"(\d{8})",
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, stem)
-        if m:
-            dt = _parse_dt_safe(m.group(1))
-            if dt:
-                return dt
-    return None
-
-def iter_order_json_files():
-    """
-    Возвращает ВСЕ json-файлы из папки orders.
-    Важно: Path.glob("*.json") на Windows может пропускать файлы с .JSON/.Json
-    и не показывает, из какой именно папки программа читает orders.
-    Поэтому используем iterdir() и проверку расширения без учета регистра.
-    """
-    files = []
-    try:
-        for p in ORDERS_DIR.iterdir():
-            if p.is_file() and p.suffix.lower() == ".json":
-                files.append(p)
-    except Exception as e:
-        print(f"Ошибка чтения папки orders: {ORDERS_DIR} — {e}")
-    return files
-
-def get_order_sort_dt(path: Path):
-    """Дата сортировки: сначала date/orderDate внутри JSON, потом дата из имени, потом дата изменения файла."""
-    try:
-        with path.open(encoding="utf-8-sig") as h:
-            data = json.load(h)
-        dt = _parse_dt_safe(data.get("date", ""))
-        if not dt:
-            date_str = data.get("orderDate") or data.get("created_at") or data.get("createdAt") or data.get("time")
-            dt = _parse_dt_safe(date_str)
-        if dt:
-            return dt
-    except Exception:
-        pass
-
-    dt = parse_dt_from_filename(path.name)
-    if dt:
-        return dt
-
-    try:
-        return datetime.fromtimestamp(path.stat().st_mtime)
-    except Exception:
-        return datetime.min
-
-def get_order_number(order: dict) -> str:
-    """
-    Чековая программа не создаёт и не вычисляет номер.
-    Она использует только номер, который прислал бот.
-    """
-    return str(
-        order.get("order_number")
-        or order.get("orderNumber")
-        or order.get("order_no")
-        or order.get("orderNo")
-        or ""
-    ).strip()
+MAX_BONUS_REDEEM_PERCENT = 20
 
 
-def get_receipt_number(filename: str) -> int:
-    """
-    Номер чека считается только по JSON-файлам в папке orders:
-    файлы сортируются по дате и получают порядковые номера с 1.
+# ============================================================================
+# БАЗА ДАННЫХ
+# ============================================================================
 
-    Для нового заказа номер чека равен количеству JSON-файлов.
-    Дополнительный SM-* от бота на расчёт не влияет.
-    """
-    records = []
+async def init_database() -> None:
+    global db_pool
 
-    for path in iter_order_json_files():
-        try:
-            with path.open(encoding="utf-8-sig") as handle:
-                data = json.load(handle)
-
-            dt = (
-                _parse_dt_safe(data.get("date", ""))
-                or _parse_dt_safe(data.get("orderDate", ""))
-                or parse_dt_from_filename(path.name)
-                or datetime.fromtimestamp(path.stat().st_mtime)
-            )
-        except Exception:
-            dt = datetime.min
-
-        records.append(
-            (
-                dt,
-                path.name.lower(),
-                path.name,
-            )
-        )
-
-    records.sort(
-        key=lambda row: (
-            row[0],
-            row[1],
-        )
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        command_timeout=30,
     )
 
-    target_name = Path(filename).name.lower()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                username TEXT,
+                telegram_first_name TEXT,
+                telegram_last_name TEXT,
+                profile_name TEXT,
+                phone TEXT,
+                address TEXT,
+                photo_url TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_bot_activity_at TIMESTAMPTZ,
+                last_site_visit_at TIMESTAMPTZ
+            );
 
-    for receipt_number, (_, _, stored_name) in enumerate(
-        records,
-        start=1,
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS username TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS telegram_first_name TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS telegram_last_name TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS profile_name TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS phone TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS address TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS photo_url TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS created_at
+                TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS updated_at
+                TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_bot_activity_at
+                TIMESTAMPTZ;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_site_visit_at
+                TIMESTAMPTZ;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS is_active
+                BOOLEAN NOT NULL DEFAULT TRUE;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS marketing_allowed
+                BOOLEAN NOT NULL DEFAULT TRUE;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS blocked_at
+                TIMESTAMPTZ;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_send_error
+                TEXT;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_successful_send_at
+                TIMESTAMPTZ;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_broadcast_at
+                TIMESTAMPTZ;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS last_keyboard_sent_at
+                TIMESTAMPTZ;
+
+
+            /*
+             * Историческая сумма покупок,
+             * заданная менеджером через /bonus.
+             */
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS manual_spend
+                BIGINT NOT NULL DEFAULT 0;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS bonus_updated_at
+                TIMESTAMPTZ;
+
+
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS bonus_updated_by
+                BIGINT;
+
+
+            CREATE INDEX IF NOT EXISTS idx_users_active
+            ON users(is_active);
+
+
+            CREATE INDEX IF NOT EXISTS idx_users_marketing
+            ON users(marketing_allowed);
+
+
+            CREATE INDEX IF NOT EXISTS idx_users_last_activity
+            ON users(last_bot_activity_at);
+
+
+            CREATE TABLE IF NOT EXISTS visits (
+                id BIGSERIAL PRIMARY KEY,
+
+                telegram_id BIGINT
+                    REFERENCES users(telegram_id)
+                    ON DELETE SET NULL,
+
+                visited_at TIMESTAMPTZ
+                    NOT NULL DEFAULT NOW(),
+
+                session_key TEXT,
+                user_agent TEXT
+            );
+
+
+            CREATE INDEX IF NOT EXISTS idx_visits_visited_at
+            ON visits(visited_at);
+
+
+            CREATE INDEX IF NOT EXISTS idx_visits_telegram_id
+            ON visits(telegram_id);
+
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id BIGSERIAL PRIMARY KEY,
+
+                telegram_id BIGINT NOT NULL
+                    REFERENCES users(telegram_id)
+                    ON DELETE RESTRICT,
+
+                source TEXT
+                    NOT NULL DEFAULT 'mini_app',
+
+                customer_name TEXT,
+                phone TEXT,
+                address TEXT,
+                address_plain TEXT,
+                payment_method TEXT,
+
+                delivery_fee INTEGER
+                    NOT NULL DEFAULT 0,
+
+                items_total INTEGER
+                    NOT NULL DEFAULT 0,
+
+                discount_percent INTEGER
+                    NOT NULL DEFAULT 0,
+
+                discount_amount INTEGER
+                    NOT NULL DEFAULT 0,
+
+                total INTEGER
+                    NOT NULL DEFAULT 0,
+
+                order_when TEXT,
+                order_date DATE,
+                order_time TEXT,
+                comment TEXT,
+
+                status TEXT
+                    NOT NULL DEFAULT 'created',
+
+                created_at TIMESTAMPTZ
+                    NOT NULL DEFAULT NOW()
+            );
+
+
+            /*
+             * Номер заказа назначает только бот.
+             * Первый новый номер: SM-472.
+             */
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS order_number TEXT;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS bonus_used INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS cashback_percent INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS cashback_earned INTEGER NOT NULL DEFAULT 0;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS loyalty_request_id TEXT;
+
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_number
+            ON orders(order_number)
+            WHERE order_number IS NOT NULL;
+
+
+            /*
+             * Последовательность хранится в PostgreSQL,
+             * поэтому не сбрасывается при Redeploy Railway.
+             *
+             * Если последовательность создаётся впервые,
+             * учитываем уже записанные номера SM-*.
+             */
+            DO $order_number_sequence$
+            DECLARE
+                max_existing_number BIGINT;
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_class
+                    WHERE relkind = 'S'
+                      AND relname = 'sm_order_number_seq'
+                )
+                THEN
+                    CREATE SEQUENCE sm_order_number_seq
+                    START WITH 472
+                    INCREMENT BY 1
+                    MINVALUE 1
+                    NO MAXVALUE
+                    CACHE 1;
+
+                    SELECT COALESCE(
+                        MAX(
+                            CASE
+                                WHEN order_number ~ '^SM-[0-9]+$'
+                                THEN SUBSTRING(order_number FROM 4)::BIGINT
+                                ELSE NULL
+                            END
+                        ),
+                        471
+                    )
+                    INTO max_existing_number
+                    FROM orders;
+
+                    PERFORM setval(
+                        'sm_order_number_seq',
+                        GREATEST(max_existing_number, 471),
+                        TRUE
+                    );
+                END IF;
+            END
+            $order_number_sequence$;
+
+
+
+            CREATE INDEX IF NOT EXISTS idx_orders_created_at
+            ON orders(created_at);
+
+
+            CREATE INDEX IF NOT EXISTS idx_orders_telegram_id
+            ON orders(telegram_id);
+
+
+            CREATE TABLE IF NOT EXISTS order_items (
+                id BIGSERIAL PRIMARY KEY,
+
+                order_id BIGINT NOT NULL
+                    REFERENCES orders(id)
+                    ON DELETE CASCADE,
+
+                item_name TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_price INTEGER NOT NULL,
+                image_url TEXT
+            );
+
+
+            CREATE INDEX IF NOT EXISTS idx_order_items_order_id
+            ON order_items(order_id);
+
+
+            /*
+             * История массовых рассылок.
+             */
+            CREATE TABLE IF NOT EXISTS broadcast_logs (
+                id BIGSERIAL PRIMARY KEY,
+                broadcast_type TEXT,
+                created_by BIGINT,
+                source_chat_id BIGINT,
+                source_message_id BIGINT,
+                total_targets INTEGER NOT NULL DEFAULT 0,
+                delivered INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'created',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                completed_at TIMESTAMPTZ
+            );
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS broadcast_type TEXT;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS created_by BIGINT;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS source_chat_id BIGINT;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS source_message_id BIGINT;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS total_targets
+                INTEGER NOT NULL DEFAULT 0;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS delivered
+                INTEGER NOT NULL DEFAULT 0;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS blocked
+                INTEGER NOT NULL DEFAULT 0;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS failed
+                INTEGER NOT NULL DEFAULT 0;
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS status
+                TEXT NOT NULL DEFAULT 'created';
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS created_at
+                TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+
+            ALTER TABLE broadcast_logs
+            ADD COLUMN IF NOT EXISTS completed_at
+                TIMESTAMPTZ;
+
+
+            /*
+             * Исправление старой таблицы,
+             * где колонка называлась kind.
+             */
+            DO $broadcast_migration$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'broadcast_logs'
+                      AND column_name = 'kind'
+                )
+                THEN
+                    EXECUTE '
+                        UPDATE broadcast_logs
+                        SET broadcast_type =
+                            COALESCE(broadcast_type, kind)
+                    ';
+
+                    EXECUTE '
+                        ALTER TABLE broadcast_logs
+                        ALTER COLUMN kind DROP NOT NULL
+                    ';
+                END IF;
+            END
+            $broadcast_migration$;
+
+
+            UPDATE broadcast_logs
+            SET broadcast_type = 'unknown'
+            WHERE broadcast_type IS NULL;
+
+
+            ALTER TABLE broadcast_logs
+            ALTER COLUMN broadcast_type SET DEFAULT 'unknown';
+
+
+            ALTER TABLE broadcast_logs
+            ALTER COLUMN broadcast_type SET NOT NULL;
+
+
+            CREATE INDEX IF NOT EXISTS idx_broadcast_logs_created_at
+            ON broadcast_logs(created_at DESC);
+
+
+            /*
+             * История ручных начислений лояльности.
+             */
+            CREATE TABLE IF NOT EXISTS loyalty_adjustments (
+                id BIGSERIAL PRIMARY KEY,
+                request_id TEXT UNIQUE,
+                telegram_id BIGINT NOT NULL,
+                previous_amount BIGINT NOT NULL DEFAULT 0,
+                new_amount BIGINT NOT NULL DEFAULT 0,
+                created_by BIGINT,
+                source TEXT NOT NULL DEFAULT 'manager_bonus',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+
+
+            CREATE INDEX IF NOT EXISTS idx_loyalty_adjustments_user
+            ON loyalty_adjustments(telegram_id);
+
+
+            CREATE INDEX IF NOT EXISTS idx_loyalty_adjustments_created
+            ON loyalty_adjustments(created_at DESC);
+            """
+        )
+
+        await conn.execute(
+            """
+            UPDATE broadcast_logs
+            SET
+                status = 'interrupted',
+                completed_at = NOW()
+            WHERE status = 'running'
+            """
+        )
+
+    logger.info(
+        "База данных подключена, таблицы готовы"
+    )
+
+
+async def upsert_user(
+    user: types.User | None,
+) -> asyncpg.Record | None:
+    if not db_pool or not user:
+        return None
+
+    if user.is_bot:
+        return None
+
+    try:
+        row = await db_pool.fetchrow(
+            """
+            INSERT INTO users (
+                telegram_id,
+                username,
+                telegram_first_name,
+                telegram_last_name,
+                created_at,
+                updated_at,
+                last_bot_activity_at,
+                is_active,
+                blocked_at,
+                last_send_error
+            )
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                NOW(),
+                NOW(),
+                NOW(),
+                TRUE,
+                NULL,
+                NULL
+            )
+
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                telegram_first_name = EXCLUDED.telegram_first_name,
+                telegram_last_name = EXCLUDED.telegram_last_name,
+                updated_at = NOW(),
+                last_bot_activity_at = NOW(),
+                is_active = TRUE,
+                blocked_at = NULL,
+                last_send_error = NULL
+
+            RETURNING
+                telegram_id,
+                username,
+                telegram_first_name,
+                telegram_last_name,
+                created_at,
+                last_bot_activity_at,
+                manual_spend
+            """,
+            user.id,
+            user.username,
+            user.first_name,
+            user.last_name,
+        )
+
+        logger.info(
+            "USER SAVED: id=%s username=@%s name=%s %s",
+            row["telegram_id"],
+            row["username"] or "-",
+            row["telegram_first_name"] or "",
+            row["telegram_last_name"] or "",
+        )
+
+        return row
+
+    except Exception:
+        logger.exception(
+            "USER SAVE ERROR: id=%s",
+            getattr(
+                user,
+                "id",
+                "unknown",
+            ),
+        )
+
+        return None
+
+
+async def set_marketing_allowed(
+    telegram_id: int,
+    allowed: bool,
+) -> None:
+    if not db_pool:
+        return
+
+    await db_pool.execute(
+        """
+        UPDATE users
+        SET
+            marketing_allowed = $2,
+            updated_at = NOW(),
+            is_active = TRUE,
+            blocked_at = NULL
+        WHERE telegram_id = $1
+        """,
+        telegram_id,
+        allowed,
+    )
+
+
+async def mark_send_success(
+    telegram_id: int,
+    send_type: str,
+) -> None:
+    if not db_pool:
+        return
+
+    if send_type == "broadcast":
+        await db_pool.execute(
+            """
+            UPDATE users
+            SET
+                is_active = TRUE,
+                blocked_at = NULL,
+                last_send_error = NULL,
+                last_successful_send_at = NOW(),
+                last_broadcast_at = NOW()
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+
+    elif send_type == "keyboard":
+        await db_pool.execute(
+            """
+            UPDATE users
+            SET
+                is_active = TRUE,
+                blocked_at = NULL,
+                last_send_error = NULL,
+                last_successful_send_at = NOW(),
+                last_keyboard_sent_at = NOW()
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+
+    else:
+        await db_pool.execute(
+            """
+            UPDATE users
+            SET
+                is_active = TRUE,
+                blocked_at = NULL,
+                last_send_error = NULL,
+                last_successful_send_at = NOW()
+            WHERE telegram_id = $1
+            """,
+            telegram_id,
+        )
+
+
+async def mark_send_error(
+    telegram_id: int,
+    error_text: str,
+    deactivate: bool,
+) -> None:
+    if not db_pool:
+        return
+
+    await db_pool.execute(
+        """
+        UPDATE users
+        SET
+            is_active = CASE
+                WHEN $3 THEN FALSE
+                ELSE is_active
+            END,
+
+            blocked_at = CASE
+                WHEN $3 THEN NOW()
+                ELSE blocked_at
+            END,
+
+            last_send_error = LEFT($2, 1000),
+            updated_at = NOW()
+
+        WHERE telegram_id = $1
+        """,
+        telegram_id,
+        error_text,
+        deactivate,
+    )
+
+
+# ============================================================================
+# АВТОМАТИЧЕСКОЕ СОХРАНЕНИЕ ПОЛЬЗОВАТЕЛЯ
+# ============================================================================
+
+class UserTrackingMiddleware(
+    BaseMiddleware
+):
+    async def __call__(
+        self,
+        handler,
+        event,
+        data,
     ):
-        if stored_name.lower() == target_name:
-            return receipt_number
+        user = data.get(
+            "event_from_user"
+        )
+
+        if user:
+            await upsert_user(
+                user
+            )
+
+        return await handler(
+            event,
+            data,
+        )
+
+
+dp.message.outer_middleware(
+    UserTrackingMiddleware()
+)
+
+dp.callback_query.outer_middleware(
+    UserTrackingMiddleware()
+)
+
+
+# ============================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================================
+
+def safe_int(
+    value,
+    default: int = 0,
+) -> int:
+    try:
+        return int(value)
+
+    except Exception:
+        return default
+
+
+def safe_str(
+    value,
+    default: str = "",
+) -> str:
+    try:
+        if value is None:
+            return default
+
+        return str(value)
+
+    except Exception:
+        return default
+
+
+def is_admin(
+    telegram_id: int,
+) -> bool:
+    return (
+        telegram_id
+        == ADMIN_CHAT_ID
+    )
+
+
+def is_blocking_error(
+    error: Exception,
+) -> bool:
+    if isinstance(
+        error,
+        TelegramForbiddenError,
+    ):
+        return True
+
+    error_text = str(
+        error
+    ).lower()
+
+    blocking_phrases = (
+        "bot was blocked by the user",
+        "bot was blocked",
+        "chat not found",
+        "user is deactivated",
+        "bot was kicked",
+        "forbidden",
+    )
+
+    return any(
+        phrase in error_text
+        for phrase in blocking_phrases
+    )
+
+
+def parse_money_amount(
+    value: str,
+) -> int | None:
+    cleaned = (
+        str(value or "")
+        .replace("฿", "")
+        .replace("₽", "")
+        .replace(" ", "")
+        .replace(",", "")
+        .strip()
+    )
+
+    if not cleaned.isdigit():
+        return None
+
+    amount = int(
+        cleaned
+    )
+
+    if (
+        amount < 0
+        or amount > 10_000_000
+    ):
+        return None
+
+    return amount
+
+
+def discount_by_spend(
+    total_spend: int,
+) -> int:
+    if total_spend >= 20_000:
+        return 20
+
+    if total_spend >= 15_000:
+        return 15
+
+    if total_spend >= 10_000:
+        return 10
+
+    if total_spend >= 5_000:
+        return 5
 
     return 0
 
 
-def validate_order_number(order_number: str) -> bool:
-    return bool(
-        re.fullmatch(
-            r"SM-[0-9]+",
-            str(order_number or "").strip(),
+# ============================================================================
+# HEALTHCHECK И ПЛАНОВЫЙ ПЕРЕЗАПУСК
+# ============================================================================
+
+def run_fake_server(
+    port: int = PORT,
+) -> None:
+    class Handler(
+        BaseHTTPRequestHandler
+    ):
+        def do_GET(self) -> None:
+            self.send_response(
+                200
+            )
+
+            self.end_headers()
+
+            self.wfile.write(
+                b"OK"
+            )
+
+        def log_message(
+            self,
+            format: str,
+            *args,
+        ) -> None:
+            return
+
+    server = HTTPServer(
+        (
+            "",
+            port,
+        ),
+        Handler,
+    )
+
+    threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+    ).start()
+
+
+def schedule_restart() -> None:
+    if RESTART_MINUTES <= 0:
+        logger.info(
+            "Плановый перезапуск отключён"
+        )
+        return
+
+    def _restart() -> None:
+        global broadcast_running
+
+        if broadcast_running:
+            logger.warning(
+                "Перезапуск отложен: выполняется рассылка"
+            )
+
+            retry_timer = threading.Timer(
+                600,
+                _restart,
+            )
+
+            retry_timer.daemon = True
+            retry_timer.start()
+
+            return
+
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                *sys.argv,
+            ],
+        )
+
+    timer = threading.Timer(
+        RESTART_MINUTES * 60,
+        _restart,
+    )
+
+    timer.daemon = True
+    timer.start()
+
+
+# ============================================================================
+# ПОДПИСАННАЯ ССЫЛКА MINI APP
+# ============================================================================
+
+def build_signed_webapp_url(
+    user: types.User,
+) -> str:
+    payload = {
+        "i": user.id,
+        "n": user.username or "",
+        "f": user.first_name or "",
+        "l": user.last_name or "",
+        "t": int(time.time()),
+    }
+
+    payload_json = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode(
+        "utf-8"
+    )
+
+    token = (
+        base64
+        .urlsafe_b64encode(
+            payload_json
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+    signature = hmac.new(
+        API_TOKEN.encode(
+            "utf-8"
+        ),
+        token.encode(
+            "ascii"
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+
+    parts = urlsplit(
+        WEBAPP_URL
+    )
+
+    query = dict(
+        parse_qsl(
+            parts.query,
+            keep_blank_values=True,
         )
     )
 
-def print_to_windows_printer(text: str):
-    printer_name = win32print.GetDefaultPrinter()
-    if not printer_name:
-        raise RuntimeError("Не найден принтер по умолчанию")
-
-    hdc = win32ui.CreateDC()
-    hdc.CreatePrinterDC(printer_name)
-    hdc.StartDoc("Smoke Factory BBQ — Receipt")
-    hdc.StartPage()
-
-    y = 10
-    try:
-        logo_path = BASE_DIR / "2.bmp"
-        if logo_path.exists():
-            img = Image.open(logo_path)
-            dib = ImageWin.Dib(img)
-            dib.draw(hdc.GetHandleOutput(), (80, y, 500, y + 350))
-            y += 360
-        else:
-            y += 30
-    except Exception as e:
-        print(f"Ошибка логотипа: {e}")
-        y += 30
-
-    for line in wrap_text(text, MAX_LINE_WIDTH):
-        try:
-            hdc.TextOut(10, y, line)
-        except Exception:
-            hdc.TextOut(10, y, line.encode("ascii", "ignore").decode("ascii"))
-        y += 50
-
-    hdc.EndPage()
-    hdc.EndDoc()
-    hdc.DeleteDC()
-
-
-def print_report_to_windows_printer(text: str):
-    """
-    Отдельная печать только для Daily/Montly reports.
-    Обычные чеки НЕ меняет: логотип, шрифт и формат чеков остаются в print_to_windows_printer().
-    Для отчетов используется компактная печать без логотипа и с переходом на новую страницу,
-    чтобы длинный месячный отчет не обрезался.
-    """
-    printer_name = win32print.GetDefaultPrinter()
-    if not printer_name:
-        raise RuntimeError("Не найден принтер по умолчанию")
-
-    hdc = win32ui.CreateDC()
-    hdc.CreatePrinterDC(printer_name)
-    hdc.StartDoc("Smoke Factory BBQ — Report")
-    hdc.StartPage()
-
-    # Компактный шрифт только для отчетов.
-    try:
-        font = win32ui.CreateFont({
-            "name": "Courier New",
-            "height": 22,
-            "weight": 400,
-        })
-        hdc.SelectObject(font)
-    except Exception as e:
-        print(f"Ошибка шрифта отчёта: {e}")
-
-    y = 20
-    line_height = 30
-
-    # Рабочая высота страницы. Если принтер вернул ошибочные параметры,
-    # используем безопасный запас.
-    try:
-        page_height = hdc.GetDeviceCaps(10) - 100  # VERTRES
-        if page_height <= 0:
-            page_height = 1800
-    except Exception:
-        page_height = 1800
-
-    for line in wrap_text(text, MAX_LINE_WIDTH):
-        if y > page_height:
-            hdc.EndPage()
-            hdc.StartPage()
-            y = 20
-            try:
-                hdc.SelectObject(font)
-            except Exception:
-                pass
-
-        try:
-            hdc.TextOut(10, y, line)
-        except Exception:
-            hdc.TextOut(10, y, line.encode("ascii", "ignore").decode("ascii"))
-        y += line_height
-
-    hdc.EndPage()
-    hdc.EndDoc()
-    hdc.DeleteDC()
-
-def format_receipt(order: dict, filename: str) -> str:
-    receipt_number = get_receipt_number(filename)
-    order_number = get_order_number(order)
-
-    if not order_number:
-        order_number = (
-            f"OLD-{Path(filename).stem}"
-        )
-
-    lines = [
-        "Smoke Factory BBQ co., LTD",
-        COMPANY_ADDRESS,
-        COMPANY_TAX_ID,
-        f"Receipt № {receipt_number}",
-        f"Order № {order_number}",
-        ""
-    ]
-    lines += [
-        f"Date: {order.get('date','')}",
-        f"Name: {order.get('name','')}",
-        f"Phone: {order.get('phone','')}",
-        f"Address: {order.get('address','')}",
-        "-" * 32,
-    ]
-
-    for item in order.get("items", []):
-        name = TRANSLATIONS.get(item.get('name',''), item.get('name',''))
-        qty = float(item.get('qty', 0) or 0)
-        price = float(item.get('price', 0) or 0)
-        total_line = round(qty * price, 2)
-        qty_disp = int(qty) if float(qty).is_integer() else qty
-        lines.append(f"{name} x{qty_disp} = {total_line:.2f} ฿")
-
-    delivery = float(
-        order.get(
-            "delivery",
-            0,
-        )
-        or 0
-    )
-
-    total = float(
-        order.get(
-            "total",
-            0,
-        )
-        or 0
-    )
-
-    discount_percent = int(
-        order.get(
-            "discount_percent",
-            0,
-        )
-        or 0
-    )
-
-    discount_amount = float(
-        order.get(
-            "discount_amount",
-            0,
-        )
-        or 0
-    )
-
-    lines.append(
-        "-" * 32
-    )
-
-    if discount_amount > 0:
-        lines.append(
-            f"Discount ({discount_percent}%): "
-            f"-{discount_amount:.2f} ฿"
-        )
-
-    lines += [
-        f"Delivery: {delivery:.2f} ฿",
-        f"Total: {total:.2f} ฿",
-    ]
-
-    raw_payment = order.get('payment','')
-    mapped_payment = PAYMENT_MAP.get(raw_payment, raw_payment)
-    lines.append(f"Payment: {mapped_payment}")
-
-    lines += ["", "Thank you for your order!"]
-    return "\n".join(lines)
-
-def save_order_to_file(fname: str, order: dict):
-    path = ORDERS_DIR / fname
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(order, f, ensure_ascii=False, indent=2)
-
-
-def find_saved_order_by_number(order_number: str):
-    """
-    Идемпотентность /order: один SM-* может быть сохранён только один раз.
-
-    Возвращает имя уже существующего JSON, если такой номер заказа
-    ранее был принят чековой программой. Повторный POST тогда безопасно
-    получает HTTP 200, но новый файл и новое уведомление не создаются.
-    """
-    wanted = str(order_number or "").strip()
-    if not wanted:
-        return None
-
-    for path in iter_order_json_files():
-        try:
-            with path.open(encoding="utf-8-sig") as handle:
-                saved = json.load(handle)
-            if get_order_number(saved) == wanted:
-                return path.name
-        except Exception:
-            # Повреждённый старый файл не должен ломать приём новых заказов.
-            continue
-
-    return None
-
-# ===================== СКРЫТАЯ GRAB-ПЕЧАТЬ: СЛУЖЕБНЫЕ ФУНКЦИИ =====================
-def validate_grab_order_number(order_number: str) -> bool:
-    """Этикетки печатаются для номеров вида GF-342 и SM-472."""
-    return bool(
-        re.fullmatch(
-            r"(?:GF|SM)-[0-9]+",
-            str(order_number or "").strip().upper(),
-        )
-    )
-
-
-def _grab_log(message: str):
-    """Пишет служебные ошибки в файл, не меняя интерфейс чековой программы."""
-    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
-    try:
-        with (GRAB_DIR / "grab_print.log").open("a", encoding="utf-8") as handle:
-            handle.write(line)
-    except Exception:
-        pass
-    try:
-        print(message)
-    except Exception:
-        pass
-
-
-def _find_label_font(size: int):
-    """Arial на Windows; резервные варианты нужны только для совместимости."""
-    candidates = [
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "arial.ttf",
-        Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts" / "segoeui.ttf",
-        BASE_DIR / "arial.ttf",
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-    ]
-
-    for candidate in candidates:
-        try:
-            if candidate.exists():
-                return ImageFont.truetype(str(candidate), size=size)
-        except Exception:
-            pass
-
-    return ImageFont.load_default()
-
-
-def create_grab_label_image(order_number: str, output_path: Path):
-    """
-    Берёт исходный макет без изменения дизайна.
-    Закрывается только старый номер на шаблоне и на его месте рисуется новый GF-* или SM-*.
-    Затем изображение без растягивания приводится к рабочему полю B1 384x240.
-    """
-    if not GRAB_TEMPLATE_PATH.exists():
-        raise FileNotFoundError(
-            f"Не найден макет этикетки: {GRAB_TEMPLATE_PATH}"
-        )
-
-    number = str(order_number or "").strip().upper()
-    image = Image.open(GRAB_TEMPLATE_PATH).convert("RGBA")
-    draw = ImageDraw.Draw(image)
-
-    # Координаты только области номера в оригинальном макете 800x480.
-    # Вертикальная линия, рамка, логотип и текст ниже не затрагиваются.
-    number_box = (338, 90, 698, 188)
-    draw.rectangle(number_box, fill=(255, 255, 255, 255))
-
-    box_width = number_box[2] - number_box[0]
-    box_height = number_box[3] - number_box[1]
-
-    font = None
-    text_bbox = None
-
-    # Подбираем размер автоматически: короткие и длинные GF-/SM-номера помещаются
-    # в ту же область, где был исходный GF-342.
-    for font_size in range(110, 39, -2):
-        candidate = _find_label_font(font_size)
-        bbox = draw.textbbox((0, 0), number, font=candidate)
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-        if width <= box_width - 4 and height <= box_height - 4:
-            font = candidate
-            text_bbox = bbox
-            break
-
-    if font is None:
-        font = _find_label_font(40)
-        text_bbox = draw.textbbox((0, 0), number, font=font)
-
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
-    center_x = (number_box[0] + number_box[2]) / 2
-    center_y = 139
-
-    text_x = center_x - text_width / 2 - text_bbox[0]
-    text_y = center_y - text_height / 2 - text_bbox[1]
-
-    draw.text(
-        (round(text_x), round(text_y)),
-        number,
-        font=font,
-        fill=(0, 0, 0, 255),
-    )
-
-    # Макет 800x480 имеет физическое соотношение 50x30.
-    # Печатающая головка B1 — 384 пикселя (48 мм), поэтому сохраняем пропорции
-    # и симметрично убираем только непечатаемые края, не растягивая дизайн.
-    resampling = getattr(Image, "Resampling", Image)
-    prepared = ImageOps.fit(
-        image.convert("RGB"),
-        (GRAB_LABEL_WIDTH, GRAB_LABEL_HEIGHT),
-        method=resampling.LANCZOS,
-        centering=(0.5, 0.5),
-    )
-    prepared.save(output_path, "PNG")
-
-
-def save_grab_number(order_number: str):
-    """Сохраняет в GRAB только полученный номер заказа."""
-    number = str(order_number or "").strip().upper()
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    safe_number = re.sub(r"[^A-Z0-9_-]+", "_", number)
-
-    json_path = GRAB_DIR / f"{stamp}_{safe_number}.json"
-    image_path = GRAB_DIR / f"{stamp}_{safe_number}.png"
-
-    with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(
-            {"order_number": number},
-            handle,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    return json_path, image_path
-
-
-def queue_grab_label(order_number: str):
-    """Сохраняет номер и ставит невидимую задачу печати в очередь."""
-    json_path, image_path = save_grab_number(order_number)
-    GRAB_PRINT_QUEUE.put(
+    query.update(
         {
-            "order_number": str(order_number).strip().upper(),
-            "json_path": json_path,
-            "image_path": image_path,
+            "u": token,
+            "s": signature,
         }
     )
-    return json_path
+
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            parts.path or "/",
+            urlencode(query),
+            parts.fragment,
+        )
+    )
 
 
-def grab_print_worker():
-    """Последовательно печатает этикетки, чтобы BLE-задания не пересекались."""
-    while True:
-        task = GRAB_PRINT_QUEUE.get()
-
-        try:
-            order_number = task["order_number"]
-            image_path = Path(task["image_path"])
-
-            create_grab_label_image(order_number, image_path)
-
-            if print_niimbot_file is None:
-                raise RuntimeError(
-                    "Не установлена библиотека bleak или не загружен "
-                    f"niimbot_b1_ble.py: {NIIMBOT_IMPORT_ERROR}"
-                )
-
-            asyncio.run(
-                print_niimbot_file(
-                    str(image_path),
-                    GRAB_BLE_ADDRESS,
-                    density=GRAB_PRINT_DENSITY,
-                    threshold=GRAB_IMAGE_THRESHOLD,
-                    offset_y=0,
-                )
+def start_keyboard(
+    user: types.User,
+) -> types.ReplyKeyboardMarkup:
+    web_app_btn = types.KeyboardButton(
+        text=MENU_BTN_TEXT,
+        web_app=types.WebAppInfo(
+            url=build_signed_webapp_url(
+                user
             )
+        ),
+    )
 
-            _grab_log(f"Grab-этикетка напечатана: {order_number}")
+    ask_btn = types.KeyboardButton(
+        text=ASK_BTN_TEXT
+    )
 
-        except Exception as exc:
-            _grab_log(
-                "Ошибка печати Grab-этикетки: "
-                f"{exc}\n{traceback.format_exc()}"
-            )
-        finally:
-            GRAB_PRINT_QUEUE.task_done()
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                web_app_btn
+            ],
+            [
+                ask_btn
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
-# ===================== НОРМАЛИЗАЦИЯ ЗАКАЗА =====================
-def canonicalize(src: dict) -> dict:
-    """
-    Поддерживает оба формата:
-      A) WebApp: items = {name:{qty,price}}, payMethod, orderDate, orderTime
-      B) Старый : items = [{name,qty,price}], payment, date
-    """
-    order = {}
+def updated_keyboard(
+    user: types.User,
+) -> types.ReplyKeyboardMarkup:
+    return start_keyboard(
+        user
+    )
 
-    # Номер назначается ботом.
-    order_number = str(
-        src.get("order_number")
-        or src.get("orderNumber")
-        or src.get("order_no")
-        or src.get("orderNo")
-        or ""
-    ).strip()
 
-    if order_number:
-        order["order_number"] = order_number
+async def send_main_keyboard(
+    message: types.Message,
+    text: str,
+    force: bool = False,
+) -> bool:
+    uid = message.from_user.id
 
-    # Дата
-    date_str = src.get("date") or src.get("orderDate")
-    time_str = src.get("orderTime", "")
-    dt = None
-    if date_str:
-        if time_str:
-            dt = _parse_dt_safe(f"{date_str} {time_str}")
-        if not dt:
-            dt = _parse_dt_safe(date_str)
-    if not dt:
-        dt = datetime.now()
-    order["date"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+    if (
+        uid in KEYBOARD_SHOWN_USERS
+        and not force
+    ):
+        return False
 
-    # Контакты
-    order["name"] = src.get("name", "")
-    order["phone"] = str(src.get("phone", "") or "")
-    order["address"] = src.get("address", "")
+    await message.answer(
+        text,
+        reply_markup=start_keyboard(
+            message.from_user
+        ),
+    )
 
-    # Позиции
-    items = src.get("items") or []
-    items_list = []
-    if isinstance(items, dict):
-        for ru_name, v in items.items():
-            try:
-                qty = float(v.get("qty", 0) or 0)
-                price = float(v.get("price", 0) or 0)
-            except Exception:
-                qty, price = 0, 0
-            if qty > 0:
-                items_list.append({"name": ru_name, "qty": qty, "price": price})
-    else:
-        for it in items:
-            ru_name = str(it.get("name", ""))
-            try:
-                qty = float(it.get("qty", 0) or 0)
-                price = float(it.get("price", 0) or 0)
-            except Exception:
-                qty, price = 0, 0
-            if qty > 0:
-                items_list.append({"name": ru_name, "qty": qty, "price": price})
-    order["items"] = items_list
+    KEYBOARD_SHOWN_USERS.add(
+        uid
+    )
 
-    # Деньги
-    delivery = float(
-        src.get(
-            "delivery",
-            src.get(
-                "deliveryFee",
-                src.get(
-                    "delivery_fee",
-                    0,
-                ),
+    return True
+
+
+def make_user_from_database(
+    row: asyncpg.Record,
+) -> types.User:
+    return types.User(
+        id=int(
+            row["telegram_id"]
+        ),
+        is_bot=False,
+        first_name=(
+            row[
+                "telegram_first_name"
+            ]
+            or "Пользователь"
+        ),
+        last_name=row[
+            "telegram_last_name"
+        ],
+        username=row[
+            "username"
+        ],
+    )
+
+
+# ============================================================================
+# КНОПКИ
+# ============================================================================
+
+def build_admin_kb_full(
+    client_id: int,
+    order_id: int,
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="👤 Открыть профиль клиента",
+        url=f"tg://user?id={client_id}",
+    )
+
+    kb.button(
+        text="✍️ Написать клиенту",
+        callback_data=(
+            f"write_client:{client_id}"
+        ),
+    )
+
+    kb.button(
+        text="🧾 Отправить чек",
+        callback_data=(
+            f"resend_receipt:{order_id}"
+        ),
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+def build_admin_kb_safe(
+    client_id: int,
+    order_id: int,
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="✍️ Написать клиенту",
+        callback_data=(
+            f"write_client:{client_id}"
+        ),
+    )
+
+    kb.button(
+        text="🧾 Отправить чек",
+        callback_data=(
+            f"resend_receipt:{order_id}"
+        ),
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+def build_unsubscribe_keyboard(
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="🔕 Не получать рекламу",
+        callback_data="unsubscribe_ads",
+    )
+
+    return kb.as_markup()
+
+
+def build_broadcast_confirm_keyboard(
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="✅ Начать рассылку",
+        callback_data="broadcast_confirm",
+    )
+
+    kb.button(
+        text="❌ Отменить",
+        callback_data="broadcast_cancel",
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+def build_keyboard_update_confirm(
+) -> types.InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="✅ Отправить клавиатуру всем",
+        callback_data="keyboard_update_confirm",
+    )
+
+    kb.button(
+        text="❌ Отменить",
+        callback_data="keyboard_update_cancel",
+    )
+
+    kb.adjust(1)
+
+    return kb.as_markup()
+
+
+# ============================================================================
+# ОТПРАВКА ЗАКАЗА МЕНЕДЖЕРУ
+# ============================================================================
+
+async def send_order_to_admin(
+    admin_text_html: str,
+    client_id: int,
+    order_id: int,
+) -> None:
+    try:
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            admin_text_html,
+            parse_mode="HTML",
+            reply_markup=(
+                build_admin_kb_full(
+                    client_id,
+                    order_id,
+                )
             ),
         )
-        or 0
-    )
 
-    subtotal = sum(
-        float(i["qty"])
-        * float(i["price"])
-        for i in items_list
-    )
+        logger.info(
+            "ADMIN: заказ отправлен с полной клавиатурой"
+        )
 
-    try:
-        discount_percent = int(
-            src.get(
-                "discount_percent",
-                src.get(
-                    "discountPercent",
-                    0,
+    except Exception as exc:
+        error_text = str(
+            exc
+        )
+
+        logger.error(
+            "ADMIN send failed: %s",
+            error_text,
+        )
+
+        if (
+            "BUTTON_USER_PRIVACY_RESTRICTED"
+            in error_text
+        ):
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                admin_text_html,
+                parse_mode="HTML",
+                reply_markup=(
+                    build_admin_kb_safe(
+                        client_id,
+                        order_id,
+                    )
                 ),
             )
-            or 0
-        )
-    except Exception:
-        discount_percent = 0
 
-    try:
-        discount_amount = float(
-            src.get(
-                "discount_amount",
-                src.get(
-                    "discountAmount",
-                    src.get(
+            return
+
+        raise
+
+
+# ============================================================================
+# ЗАЩИЩЁННАЯ СИСТЕМА ЛОЯЛЬНОСТИ
+# ============================================================================
+
+def make_loyalty_signature_payload(
+    telegram_id: int,
+    order_ref: str,
+    items_total: int,
+    delivery: int,
+    requested_bonus: int,
+    timestamp: int,
+) -> str:
+    return "|".join(
+        [
+            str(telegram_id),
+            str(order_ref),
+            str(items_total),
+            str(delivery),
+            str(requested_bonus),
+            str(timestamp),
+        ]
+    )
+
+
+async def settle_loyalty_order(
+    telegram_id: int,
+    order_ref: str,
+    items_total: int,
+    delivery: int,
+    requested_bonus: int,
+) -> dict:
+    timestamp = int(time.time())
+    body = {
+        "telegramId": str(telegram_id),
+        "orderRef": str(order_ref),
+        "itemsTotal": int(items_total),
+        "delivery": int(delivery),
+        "requestedBonus": int(requested_bonus),
+    }
+
+    signature_payload = make_loyalty_signature_payload(
+        telegram_id,
+        order_ref,
+        items_total,
+        delivery,
+        requested_bonus,
+        timestamp,
+    )
+
+    signature = hmac.new(
+        API_TOKEN.encode("utf-8"),
+        signature_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    timeout = aiohttp.ClientTimeout(total=20)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            LOYALTY_SETTLE_URL,
+            json=body,
+            headers={
+                "X-Loyalty-Timestamp": str(timestamp),
+                "X-Loyalty-Signature": signature,
+            },
+        ) as response:
+            raw = await response.text()
+
+            try:
+                result = json.loads(raw)
+            except Exception:
+                result = {"ok": False, "error": raw[:500]}
+
+            if response.status != 200 or not result.get("ok"):
+                raise RuntimeError(
+                    result.get("error")
+                    or f"Loyalty HTTP {response.status}"
+                )
+
+            return result
+
+
+async def update_saved_order_loyalty(
+    order_id: int,
+    bonus_used: int,
+    cashback_percent: int,
+    cashback_earned: int,
+    final_total: int,
+    loyalty_request_id: str,
+) -> None:
+    """
+    Обновляет бонусы и итог заказа.
+
+    Номер SM-* является только номером заказа.
+    Нумерацию кассовых чеков ведёт printer_gui.py.
+    """
+    if not db_pool:
+        raise RuntimeError("База данных не подключена")
+
+    result = await db_pool.execute(
+        """
+        UPDATE orders
+        SET
+            discount_percent = 0,
+            discount_amount = $2,
+            bonus_used = $2,
+            cashback_percent = $3,
+            cashback_earned = $4,
+            total = $5,
+            loyalty_request_id = $6
+        WHERE id = $1
+        """,
+        order_id,
+        bonus_used,
+        cashback_percent,
+        cashback_earned,
+        final_total,
+        loyalty_request_id,
+    )
+
+    if result != "UPDATE 1":
+        raise RuntimeError(
+            "Заказ не найден при финализации"
+        )
+
+
+async def cancel_saved_order(order_id: int) -> None:
+    if db_pool:
+        await db_pool.execute(
+            "UPDATE orders SET status='cancelled' WHERE id=$1",
+            order_id,
+        )
+
+
+# ============================================================================
+# СОХРАНЕНИЕ ЗАКАЗА В БАЗУ
+# ============================================================================
+
+async def save_order_to_database(
+    user: types.User,
+    data: dict,
+    order_items: list[dict],
+) -> tuple[int, str]:
+    """
+    Сохраняет заказ и атомарно получает следующий номер SM-*.
+
+    SM-* — это внутренний номер заказа, а не номер кассового чека.
+    Пропуски в номерах заказов допустимы. Нумерацию чеков ведёт
+    локальная программа printer_gui.py.
+    """
+
+    if not db_pool:
+        raise RuntimeError(
+            "База данных не подключена"
+        )
+
+    await upsert_user(
+        user
+    )
+
+    items_total = sum(
+        max(
+            0,
+            safe_int(
+                item.get("qty")
+            ),
+        )
+        *
+        max(
+            0,
+            safe_int(
+                item.get("price")
+            ),
+        )
+        for item in order_items
+    )
+
+    delivery = max(
+        0,
+        safe_int(
+            data.get(
+                "delivery",
+                0,
+            )
+        ),
+    )
+
+    discount_percent = max(
+        0,
+        min(
+            100,
+            safe_int(
+                data.get(
+                    "discountPercent",
+                    data.get(
+                        "discount_percent",
+                        0,
+                    ),
+                )
+            ),
+        ),
+    )
+
+    discount_amount = max(
+        0,
+        safe_int(
+            data.get(
+                "discountAmount",
+                data.get(
+                    "discount_amount",
+                    data.get(
                         "discount",
                         0,
                     ),
                 ),
             )
-            or 0
-        )
-    except Exception:
-        discount_amount = 0.0
-
-    calculated_total = (
-        subtotal
-        - discount_amount
-        + delivery
-    )
-
-    try:
-        claimed_total = float(
-            src.get(
-                "total",
-                calculated_total,
-            )
-        )
-    except Exception:
-        claimed_total = calculated_total
-
-    # Бот уже присылает итог после скидки.
-    # Не вычитаем скидку второй раз.
-    order["delivery"] = round(
-        delivery,
-        2,
-    )
-
-    order["items_total"] = round(
-        subtotal,
-        2,
-    )
-
-    order["discount_percent"] = max(
-        0,
-        discount_percent,
-    )
-
-    order["discount_amount"] = round(
-        max(
-            0.0,
-            discount_amount,
         ),
-        2,
     )
 
-    order["total"] = round(
-        claimed_total,
-        2,
+    total = max(
+        0,
+        safe_int(
+            data.get(
+                "total",
+                items_total
+                + delivery
+                - discount_amount,
+            )
+        ),
     )
 
-    # Оплата
-    order["payment"] = (
-        src.get("payment")
-        or src.get("payMethod")
-        or ""
+    order_date = None
+
+    raw_order_date = data.get(
+        "orderDate"
     )
 
-    return order
-
-# ===================== HTTP-ПРИЁМНИК =====================
-class OrderHandler(BaseHTTPRequestHandler):
-    server_version = "OrderReceiver/1.0"
-
-    def _send(self, code=200, payload=None):
-        body = json.dumps(payload or {"ok": True}, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        # Для туннеля надёжнее завершать каждый короткий HTTP-ответ явно.
-        self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(body)
-        self.wfile.flush()
-        self.close_connection = True
-
-    def do_GET(self):
-        if urlparse(self.path).path == "/status":
-            return self._send(200, {"ok": True, "time": datetime.now().isoformat()})
-        return self._send(404, {"ok": False, "error": "not found"})
-
-    def do_POST(self):
-        path = urlparse(self.path).path
-
-        # Второй бот присылает сюда только номер заказа GF-* или SM-*.
-        # Этот маршрут работает на том же порту 8000, что и прежний /order.
-        if path in ("/grab", "/grab-label"):
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-
-                if length <= 0 or length > 4096:
-                    return self._send(
-                        400,
-                        {"ok": False, "error": "invalid content length"},
-                    )
-
-                raw = self.rfile.read(length)
-
-                try:
-                    src = json.loads(raw.decode("utf-8"))
-                except Exception as e:
-                    return self._send(
-                        400,
-                        {"ok": False, "error": f"bad json: {e}"},
-                    )
-
-                order_number = str(
-                    src.get("order_number")
-                    or src.get("orderNumber")
-                    or src.get("order_no")
-                    or src.get("orderNo")
-                    or src.get("number")
-                    or ""
-                ).strip().upper()
-
-                if not validate_grab_order_number(order_number):
-                    return self._send(
-                        400,
-                        {
-                            "ok": False,
-                            "error": (
-                                "order_number is required "
-                                "in format GF-342 or SM-472"
-                            ),
-                        },
-                    )
-
-                saved_file = queue_grab_label(order_number)
-
-                return self._send(
-                    200,
-                    {
-                        "ok": True,
-                        "queued": True,
-                        "order_number": order_number,
-                        "file": saved_file.name,
-                    },
-                )
-
-            except Exception as e:
-                _grab_log(
-                    "Ошибка получения Grab-номера: "
-                    f"{e}\n{traceback.format_exc()}"
-                )
-                return self._send(
-                    500,
-                    {"ok": False, "error": repr(e)},
-                )
-
-        # Ниже старый маршрут чековой программы оставлен без изменений.
-        if path != "/order":
-            return self._send(404, {"ok": False, "error": "not found"})
-
+    if raw_order_date:
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length)
-            try:
-                src = json.loads(raw.decode("utf-8"))
-            except Exception as e:
-                return self._send(400, {"ok": False, "error": f"bad json: {e}"})
+            order_date = datetime.strptime(
+                str(raw_order_date),
+                "%Y-%m-%d",
+            ).date()
 
-            order_number = str(
-                src.get("order_number")
-                or src.get("orderNumber")
-                or src.get("order_no")
-                or src.get("orderNo")
-                or ""
-            ).strip()
-
-            if not validate_order_number(
-                order_number
-            ):
-                return self._send(
-                    400,
-                    {
-                        "ok": False,
-                        "error": (
-                            "order_number is required "
-                            "in format SM-472"
-                        ),
-                    },
-                )
-
-            # Повторный запрос с тем же SM-* не должен создавать второй чек.
-            # Это особенно важно, если заказ уже сохранился локально, но ngrok
-            # потерял/заменил ответ и бот повторил POST.
-            existing_file = find_saved_order_by_number(order_number)
-            if existing_file:
-                return self._send(
-                    200,
-                    {
-                        "ok": True,
-                        "duplicate": True,
-                        "file": existing_file,
-                        "order_number": order_number,
-                    },
-                )
-
-            canon = canonicalize(src)
-            canon["order_number"] = order_number
-
-            # Имя JSON снова формируется как раньше — по дате и времени.
-            # Дополнительный SM-* хранится только внутри JSON и никак
-            # не влияет ни на имя файла, ни на номер чека.
-            base_name = datetime.now().strftime(
-                "%Y%m%d-%H%M%S"
-            )
-
-            fname = f"{base_name}.json"
-            duplicate_index = 2
-
-            while (ORDERS_DIR / fname).exists():
-                fname = (
-                    f"{base_name}_{duplicate_index}.json"
-                )
-                duplicate_index += 1
-
-            save_order_to_file(
-                fname,
-                canon,
-            )
-
-            root.after(
-                0,
-                on_new_order_received,
-            )
-
-            return self._send(
-                200,
-                {
-                    "ok": True,
-                    "file": fname,
-                    "order_number": order_number,
-                },
-            )
-        except Exception as e:
-            return self._send(500, {"ok": False, "error": repr(e)})
-
-def run_receiver():
-    httpd = HTTPServer((RECEIVER_HOST, RECEIVER_PORT), OrderHandler)
-    print(f"Order receiver: http://{RECEIVER_HOST}:{RECEIVER_PORT} (/order, /status)")
-    httpd.serve_forever()
-
-# ===================== GUI =====================
-root = tk.Tk()
-root.title("Smoke Factory BBQ — Чеки")
-
-frame = tk.Frame(root)
-frame.pack(padx=10, pady=10)
-
-listbox_frame = tk.Frame(frame)
-listbox_frame.grid(row=0, column=0, rowspan=6, padx=5, pady=5, sticky="ns")
-
-orders_listbox = tk.Listbox(listbox_frame, width=44, height=20)
-orders_scrollbar = tk.Scrollbar(listbox_frame, orient="vertical", command=orders_listbox.yview)
-orders_listbox.configure(yscrollcommand=orders_scrollbar.set)
-orders_listbox.pack(side="left", fill="both", expand=True)
-orders_scrollbar.pack(side="right", fill="y")
-
-status_var = tk.StringVar(value=f"Папка orders: {ORDERS_DIR}")
-tk.Label(frame, textvariable=status_var, anchor="w", fg="gray").grid(row=6, column=0, columnspan=6, sticky="ew", padx=5, pady=(0, 5))
-
-editor_text = tk.Text(frame, width=60, height=20)
-editor_text.grid(row=0, column=1, columnspan=5, padx=5, pady=5)
-
-# ===================== УВЕДОМЛЕНИЕ О НОВОМ ЗАКАЗЕ =====================
-alert_window = None
-
-def start_alarm_sound():
-    try:
-        if ALARM_SOUND.exists():
-            winsound.PlaySound(str(ALARM_SOUND), winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
-        else:
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-    except Exception as e:
-        print(f"Ошибка звука: {e}")
-
-def stop_alarm_sound():
-    try:
-        winsound.PlaySound(None, winsound.SND_PURGE)
-    except Exception as e:
-        print(f"Ошибка остановки звука: {e}")
-
-def show_new_order_alert():
-    global alert_window
-
-    if alert_window is not None and alert_window.winfo_exists():
-        alert_window.lift()
-        alert_window.focus_force()
-        return
-
-    alert_window = tk.Toplevel(root)
-    alert_window.title("НОВЫЙ ЗАКАЗ")
-    alert_window.transient(root)
-    alert_window.grab_set()
-    alert_window.resizable(False, False)
-
-    tk.Label(
-        alert_window,
-        text="НОВЫЙ ЗАКАЗ",
-        font=("Arial", 24, "bold"),
-        padx=40,
-        pady=25
-    ).pack()
-
-    def accept_order():
-        global alert_window
-        stop_alarm_sound()
-        if alert_window is not None and alert_window.winfo_exists():
-            alert_window.destroy()
-        alert_window = None
-
-    tk.Button(
-        alert_window,
-        text="Принять заказ",
-        font=("Arial", 16, "bold"),
-        command=accept_order,
-        padx=30,
-        pady=10
-    ).pack(padx=25, pady=(0, 25), fill="x")
-
-    alert_window.protocol("WM_DELETE_WINDOW", accept_order)
-    alert_window.lift()
-    alert_window.focus_force()
-
-def on_new_order_received():
-    refresh_order_list()
-    start_alarm_sound()
-    show_new_order_alert()
-
-def load_orders():
-    """Показывает в программе печати ВСЕ json из папки orders, даже если JSON битый/старого формата."""
-    files = iter_order_json_files()
-    files.sort(key=get_order_sort_dt, reverse=True)
-    return [p.name for p in files]
-
-def refresh_order_list():
-    orders_listbox.delete(0, tk.END)
-    files = load_orders()
-    for f in files:
-        orders_listbox.insert(tk.END, f)
-    try:
-        status_var.set(f"Папка orders: {ORDERS_DIR} | JSON: {len(files)}")
-    except Exception:
-        pass
-
-def on_select(event=None):
-    idxs = orders_listbox.curselection()
-    if not idxs:
-        return
-    fname = orders_listbox.get(idxs[0])
-    path = ORDERS_DIR / fname
-    try:
-        with path.open(encoding="utf-8-sig") as f:
-            order = json.load(f)
-        editor_text.delete("1.0", tk.END)
-        editor_text.insert(tk.END, json.dumps(order, ensure_ascii=False, indent=2))
-    except Exception as e:
-        # Файл всё равно должен отображаться в списке. Если JSON битый — показываем текст как есть.
-        try:
-            raw = path.read_text(encoding="utf-8-sig", errors="replace")
-            editor_text.delete("1.0", tk.END)
-            editor_text.insert(tk.END, raw)
-            messagebox.showwarning("JSON открыт как текст", f"Файл есть в orders, но JSON читается с ошибкой:\n{e}")
-        except Exception as e2:
-            messagebox.showerror("Ошибка", f"Открытие: {e}\nПовторная попытка: {e2}")
-
-orders_listbox.bind("<<ListboxSelect>>", on_select)
-
-def print_selected_order():
-    idxs = orders_listbox.curselection()
-    if not idxs:
-        messagebox.showwarning("Внимание", "Сначала выберите заказ.")
-        return
-    fname = orders_listbox.get(idxs[0])
-    try:
-        raw = editor_text.get("1.0", tk.END)
-        order = json.loads(raw)
-        save_order_to_file(fname, order)  # сохранить правки
-        receipt = format_receipt(order, fname)
-        print_to_windows_printer(receipt)
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Печать: {e}")
-
-def save_edited_order():
-    idxs = orders_listbox.curselection()
-    if not idxs:
-        messagebox.showwarning("Внимание", "Сначала выберите заказ.")
-        return
-    fname = orders_listbox.get(idxs[0])
-    try:
-        order = json.loads(editor_text.get("1.0", tk.END))
-        save_order_to_file(fname, order)
-        messagebox.showinfo("Сохранено", "Изменения сохранены.")
-        refresh_order_list()
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Сохранение: {e}")
-
-def delete_selected_order():
-    idxs = orders_listbox.curselection()
-    if not idxs:
-        return
-    fname = orders_listbox.get(idxs[0])
-    if messagebox.askyesno("Аннулировать", f"Удалить {fname}?"):
-        try:
-            (ORDERS_DIR / fname).unlink(missing_ok=True)
-            refresh_order_list()
-            editor_text.delete("1.0", tk.END)
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Удаление: {e}")
-
-def add_dish():
-    idxs = orders_listbox.curselection()
-    if not idxs:
-        messagebox.showwarning("Внимание", "Сначала выберите заказ.")
-        return
-    fname = orders_listbox.get(idxs[0])
-    path = ORDERS_DIR / fname
-    try:
-        with path.open(encoding="utf-8") as f:
-            order = json.load(f)
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Открытие: {e}")
-        return
-
-    name = simpledialog.askstring("Добавить блюдо", "Название блюда:", initialvalue="Additional dish")
-    if not name:
-        return
-    try:
-        qty = float(simpledialog.askstring("Добавить блюдо", "Количество:", initialvalue="1"))
-        price = float(simpledialog.askstring("Добавить блюдо", "Цена (฿):", initialvalue="0"))
-    except Exception:
-        messagebox.showerror("Ошибка", "Неверное количество или цена.")
-        return
-
-    order.setdefault("items", []).append({"name": name, "qty": qty, "price": price})
-    order["total"] = round(float(order.get("total", 0) or 0) + qty * price, 2)
-    save_order_to_file(fname, order)
-    editor_text.delete("1.0", tk.END)
-    editor_text.insert(tk.END, json.dumps(order, ensure_ascii=False, indent=2))
-    refresh_order_list()
-
-def apply_discount(percent: int):
-    idxs = orders_listbox.curselection()
-    if not idxs:
-        messagebox.showwarning("Внимание", "Сначала выберите заказ.")
-        return
-    fname = orders_listbox.get(idxs[0])
-    path = ORDERS_DIR / fname
-    try:
-        with path.open(encoding="utf-8") as f:
-            order = json.load(f)
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Открытие: {e}")
-        return
-    total = float(order.get("total", 0) or 0)
-    delivery = float(order.get("delivery", 0) or 0)
-    discount_amount = round((total - delivery) * (percent / 100), 2)
-    order["discount_percent"] = percent
-    order["discount_amount"]  = discount_amount
-    order["total"] = round(total - discount_amount, 2)
-    save_order_to_file(fname, order)
-    editor_text.delete("1.0", tk.END)
-    editor_text.insert(tk.END, json.dumps(order, ensure_ascii=False, indent=2))
-    refresh_order_list()
-    # печать со скидкой
-    receipt = format_receipt(order, fname)
-    print_to_windows_printer(receipt)
-
-
-# ===================== ОТЧЁТЫ =====================
-def normalize_order_for_reports(src: dict, filename: str) -> dict:
-    """
-    Приводит к одному виду все старые и новые JSON-заказы.
-    Если внутри JSON нет нормальной даты — берём дату из имени файла.
-    """
-    order = canonicalize(src)
-
-    dt = _parse_dt_safe(order.get("date", "")) or parse_dt_from_filename(filename)
-    if dt:
-        order["date"] = dt.strftime("%Y-%m-%d %H:%M:%S")
-
-    return order
-
-def load_all_orders_for_reports():
-    orders = []
-    for p in iter_order_json_files():
-        try:
-            with p.open(encoding="utf-8-sig") as f:
-                raw_order = json.load(f)
-
-            order = normalize_order_for_reports(raw_order, p.name)
-            dt = _parse_dt_safe(order.get("date", "")) or parse_dt_from_filename(p.name)
-            if not dt:
-                print(f"Пропуск заказа без даты: {p.name}")
-                continue
-
-            orders.append((dt, order, p.name))
-        except Exception as e:
-            print(f"Ошибка чтения заказа для отчёта {p.name}: {e}")
-
-    orders.sort(key=lambda x: x[0])
-    return orders
-
-def order_items_subtotal(order: dict) -> float:
-    subtotal = 0.0
-    for item in order.get("items", []):
-        try:
-            qty = float(item.get("qty", 0) or 0)
-            price = float(item.get("price", 0) or 0)
-            subtotal += qty * price
         except Exception:
-            pass
+            order_date = None
 
-    try:
-        subtotal -= float(order.get("discount_amount", 0) or 0)
-    except Exception:
-        pass
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            sequence_number = await conn.fetchval(
+                """
+                SELECT nextval(
+                    'sm_order_number_seq'
+                )
+                """
+            )
 
-    return round(max(subtotal, 0), 2)
+            order_number = (
+                f"SM-{int(sequence_number)}"
+            )
 
-def order_delivery_for_report(order: dict) -> float:
-    try:
-        return round(float(order.get("delivery", 0) or 0), 2)
-    except Exception:
-        return 0.0
+            order_id = await conn.fetchval(
+                """
+                INSERT INTO orders (
+                    order_number,
+                    telegram_id,
+                    customer_name,
+                    phone,
+                    address,
+                    address_plain,
+                    payment_method,
+                    delivery_fee,
+                    items_total,
+                    discount_percent,
+                    discount_amount,
+                    total,
+                    order_when,
+                    order_date,
+                    order_time,
+                    comment
+                )
+                VALUES (
+                    $1,$2,$3,$4,$5,$6,
+                    $7,$8,$9,$10,$11,
+                    $12,$13,$14,$15,$16
+                )
+                RETURNING id
+                """,
+                order_number,
+                user.id,
+                safe_str(
+                    data.get("name")
+                    or user.full_name
+                ),
+                safe_str(
+                    data.get("phone")
+                ),
+                safe_str(
+                    data.get("address")
+                ),
+                safe_str(
+                    data.get(
+                        "address_plain"
+                    )
+                ),
+                safe_str(
+                    data.get(
+                        "payMethod"
+                    )
+                ),
+                delivery,
+                items_total,
+                discount_percent,
+                discount_amount,
+                total,
+                safe_str(
+                    data.get(
+                        "orderWhen"
+                    )
+                ),
+                order_date,
+                safe_str(
+                    data.get(
+                        "orderTime"
+                    )
+                ),
+                safe_str(
+                    data.get("comment")
+                    or data.get(
+                        "comments"
+                    )
+                    or data.get(
+                        "note"
+                    )
+                ),
+            )
 
-def order_full_total_for_report(order: dict) -> float:
+            if order_items:
+                await conn.executemany(
+                    """
+                    INSERT INTO order_items (
+                        order_id,
+                        item_name,
+                        quantity,
+                        unit_price,
+                        image_url
+                    )
+                    VALUES (
+                        $1,$2,$3,$4,$5
+                    )
+                    """,
+                    [
+                        (
+                            order_id,
+                            item["name"],
+                            item["qty"],
+                            item["price"],
+                            item.get("img"),
+                        )
+                        for item
+                        in order_items
+                    ],
+                )
+
+    return (
+        int(order_id),
+        order_number,
+    )
+
+
+# ============================================================================
+# ОТПРАВКА / ПОВТОРНАЯ ОТПРАВКА ЧЕКА
+# ============================================================================
+
+async def build_print_payload_from_database(
+    order_id: int,
+) -> dict:
     """
-    Для отчётов берём полную сумму чека: блюда + доставка - скидка.
-    Если в JSON уже есть корректный total, используем его.
+    Восстанавливает полный payload заказа из PostgreSQL.
+    Используется кнопкой «Отправить чек», поэтому повторная отправка
+    работает даже после перезапуска Railway.
     """
-    food_sum = order_items_subtotal(order)
-    delivery = order_delivery_for_report(order)
-    calculated = round(food_sum + delivery, 2)
+    if not db_pool:
+        raise RuntimeError(
+            "База данных не подключена"
+        )
 
-    try:
-        total = round(float(order.get("total", calculated) or calculated), 2)
-    except Exception:
-        total = calculated
+    async with db_pool.acquire() as conn:
+        order_row = await conn.fetchrow(
+            """
+            SELECT
+                id,
+                order_number,
+                customer_name,
+                phone,
+                address,
+                payment_method,
+                delivery_fee,
+                items_total,
+                discount_percent,
+                discount_amount,
+                bonus_used,
+                cashback_percent,
+                cashback_earned,
+                total,
+                order_when,
+                order_date,
+                order_time,
+                comment,
+                created_at
+            FROM orders
+            WHERE id = $1
+            """,
+            order_id,
+        )
 
-    # Если total в старом JSON был только по еде и не включал доставку — добавляем доставку.
-    if delivery > 0 and abs(total - food_sum) < 0.01:
-        total = round(total + delivery, 2)
+        if not order_row:
+            raise LookupError(
+                "Заказ не найден в базе"
+            )
 
-    # Если total явно битый/нулевой, считаем сами.
-    if total <= 0 and calculated > 0:
-        total = calculated
+        item_rows = await conn.fetch(
+            """
+            SELECT
+                item_name,
+                quantity,
+                unit_price,
+                image_url
+            FROM order_items
+            WHERE order_id = $1
+            ORDER BY id
+            """,
+            order_id,
+        )
 
-    return round(total, 2)
+    order_number = safe_str(
+        order_row["order_number"]
+    )
 
-def normalize_payment_for_report(order: dict) -> str:
-    """
-    Правила для отчетов Daily/Montly:
-    - Банк РФ всегда считается как Cash
-    - True money всегда считается как PromptPay
-    - Thai bank всегда считается как PromptPay
-    """
-    raw_payment = str(order.get("payment", "") or order.get("payMethod", "") or "").strip()
-    raw_key = raw_payment.lower().replace(" ", "").replace("_", "").replace("-", "")
+    comment = safe_str(
+        order_row["comment"]
+    )
 
-    if raw_key in ("банкрф", "банкrf", "bankrf", "russianbank", "cash", "наличные"):
-        return "Cash"
-
-    if raw_key in (
-        "truemoney", "truewallet", "true", "truemoneywallet",
-        "thaibank", "thai", "promptpay", "promtpay", "prompt", "promt"
-    ):
-        return "PromptPay"
-
-    mapped_payment = PAYMENT_MAP.get(raw_payment, raw_payment).strip()
-    mapped_key = mapped_payment.lower().replace(" ", "").replace("_", "").replace("-", "")
-
-    if mapped_key in ("cash", "банкрф", "банкrf", "bankrf", "russianbank", "наличные"):
-        return "Cash"
-
-    if mapped_key in ("promptpay", "promtpay", "thaibank", "truemoney", "truewallet", "prompt", "promt"):
-        return "PromptPay"
-
-    return "Unknown"
-
-def make_report(title: str, period_line: str, filtered_orders: list) -> str:
-    sold = {}
-    total_food_sum = 0.0
-    total_delivery_sum = 0.0
-    total_receipts_sum = 0.0
-    cash_total = 0.0
-    promptpay_total = 0.0
-    unknown_total = 0.0
-
-    for _, order, _ in filtered_orders:
-        food_sum = order_items_subtotal(order)
-        delivery_sum = order_delivery_for_report(order)
-        full_sum = order_full_total_for_report(order)
-
-        total_food_sum += food_sum
-        total_delivery_sum += delivery_sum
-        total_receipts_sum += full_sum
-
-        payment_type = normalize_payment_for_report(order)
-        if payment_type == "Cash":
-            cash_total += full_sum
-        elif payment_type == "PromptPay":
-            promptpay_total += full_sum
-        else:
-            unknown_total += full_sum
-
-        for item in order.get("items", []):
-            name_ru = str(item.get("name", ""))
-            name = TRANSLATIONS.get(name_ru, name_ru)
-            try:
-                qty = float(item.get("qty", 0) or 0)
-            except Exception:
-                qty = 0
-            if qty > 0:
-                sold[name] = sold.get(name, 0) + qty
-
-    lines = [
-        "Smoke Factory BBQ co., LTD",
-        title,
-        period_line,
-        f"Orders: {len(filtered_orders)}",
-        "-" * 32,
-        "Sold items:"
+    items = [
+        {
+            "name": safe_str(
+                row["item_name"]
+            ),
+            "qty": max(
+                1,
+                safe_int(
+                    row["quantity"],
+                    1,
+                ),
+            ),
+            "price": max(
+                0,
+                safe_int(
+                    row["unit_price"],
+                    0,
+                ),
+            ),
+            "img": safe_str(
+                row["image_url"]
+            ),
+        }
+        for row in item_rows
     ]
 
-    if sold:
-        for name in sorted(sold.keys()):
-            qty = sold[name]
-            qty_disp = int(qty) if float(qty).is_integer() else round(qty, 2)
-            lines.append(f"{name} x{qty_disp}")
+    created_at = order_row[
+        "created_at"
+    ]
+
+    if created_at:
+        try:
+            created_at = created_at.astimezone(
+                TIMEZONE
+            ).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except Exception:
+            created_at = safe_str(
+                created_at
+            )
     else:
-        lines.append("No sales")
+        created_at = datetime.now(
+            TIMEZONE
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
-    lines += [
-        "-" * 32,
-        f"Food sales: {total_food_sum:.2f} ฿",
-        f"Delivery: {total_delivery_sum:.2f} ฿",
-        f"Total receipts: {total_receipts_sum:.2f} ฿",
-        f"Cash: {cash_total:.2f} ฿",
-        f"PromptPay: {promptpay_total:.2f} ฿"
-    ]
-
-    if unknown_total > 0:
-        lines.append(f"Unknown payment: {unknown_total:.2f} ฿")
-
-    return "\n".join(lines)
-
-def select_date_calendar(parent):
-    selected = {"date": None}
-    today = date.today()
-    current = {"year": today.year, "month": today.month}
-
-    win = tk.Toplevel(parent)
-    win.title("Daily report — выберите дату")
-    win.transient(parent)
-    win.grab_set()
-
-    header = tk.Frame(win)
-    header.pack(padx=10, pady=5, fill="x")
-
-    title_var = tk.StringVar()
-
-    days_frame = tk.Frame(win)
-    days_frame.pack(padx=10, pady=5)
-
-    def rebuild_calendar():
-        for w in days_frame.winfo_children():
-            w.destroy()
-
-        y = current["year"]
-        m = current["month"]
-        title_var.set(f"{calendar.month_name[m]} {y}")
-
-        week_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        for col, wd in enumerate(week_days):
-            tk.Label(days_frame, text=wd, width=5).grid(row=0, column=col, padx=1, pady=1)
-
-        month_cal = calendar.monthcalendar(y, m)
-        for r, week in enumerate(month_cal, start=1):
-            for c, day_num in enumerate(week):
-                if day_num == 0:
-                    tk.Label(days_frame, text="", width=5).grid(row=r, column=c, padx=1, pady=1)
-                else:
-                    def choose(d=day_num):
-                        selected["date"] = date(y, m, d)
-                    tk.Radiobutton(
-                        days_frame,
-                        text=str(day_num),
-                        width=5,
-                        indicatoron=False,
-                        variable=date_var,
-                        value=f"{y}-{m:02d}-{day_num:02d}",
-                        command=choose
-                    ).grid(row=r, column=c, padx=1, pady=1)
-
-    def prev_month():
-        m = current["month"] - 1
-        y = current["year"]
-        if m == 0:
-            m = 12
-            y -= 1
-        current["year"], current["month"] = y, m
-        rebuild_calendar()
-
-    def next_month():
-        m = current["month"] + 1
-        y = current["year"]
-        if m == 13:
-            m = 1
-            y += 1
-        current["year"], current["month"] = y, m
-        rebuild_calendar()
-
-    date_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
-    selected["date"] = today
-
-    tk.Button(header, text="<", command=prev_month, width=4).pack(side="left")
-    tk.Label(header, textvariable=title_var, width=20).pack(side="left", expand=True)
-    tk.Button(header, text=">", command=next_month, width=4).pack(side="right")
-
-    rebuild_calendar()
-
-    buttons = tk.Frame(win)
-    buttons.pack(padx=10, pady=10, fill="x")
-
-    def ok():
-        win.destroy()
-
-    def cancel():
-        selected["date"] = None
-        win.destroy()
-
-    tk.Button(buttons, text="OK", command=ok).pack(side="left", expand=True, fill="x", padx=3)
-    tk.Button(buttons, text="Cancel", command=cancel).pack(side="left", expand=True, fill="x", padx=3)
-
-    parent.wait_window(win)
-    return selected["date"]
-
-def daily_report():
-    chosen = select_date_calendar(root)
-    if not chosen:
-        return
-
-    all_orders = load_all_orders_for_reports()
-    filtered = [(dt, order, fname) for dt, order, fname in all_orders if dt.date() == chosen]
-
-    report = make_report(
-        "DAILY REPORT",
-        f"Date: {chosen.strftime('%d.%m.%Y')}",
-        filtered
+    order_time = safe_str(
+        order_row["order_time"]
     )
 
-    try:
-        print_report_to_windows_printer(report)
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Печать отчёта: {e}")
+    return {
+        "order_number": order_number,
+        "orderNumber": order_number,
+        "order_no": order_number,
+        "orderNo": order_number,
 
-def select_month_dialog(parent):
-    all_orders = load_all_orders_for_reports()
-    months = sorted({(dt.year, dt.month) for dt, _, _ in all_orders}, reverse=True)
+        "name": safe_str(
+            order_row["customer_name"]
+        ),
+        "phone": safe_str(
+            order_row["phone"]
+        ),
+        "address": safe_str(
+            order_row["address"]
+        ),
+        "delivery": max(
+            0,
+            safe_int(
+                order_row["delivery_fee"],
+                0,
+            ),
+        ),
+        "payment": safe_str(
+            order_row["payment_method"]
+        ),
+        "items": items,
 
-    if not months:
-        today = date.today()
-        months = [(today.year, today.month)]
+        "items_total": max(
+            0,
+            safe_int(
+                order_row["items_total"],
+                0,
+            ),
+        ),
+        "itemsTotal": max(
+            0,
+            safe_int(
+                order_row["items_total"],
+                0,
+            ),
+        ),
+        "subtotal": max(
+            0,
+            safe_int(
+                order_row["items_total"],
+                0,
+            ),
+        ),
 
-    selected = {"month": months[0]}
+        "discount_percent": max(
+            0,
+            safe_int(
+                order_row["discount_percent"],
+                0,
+            ),
+        ),
+        "discountPercent": max(
+            0,
+            safe_int(
+                order_row["discount_percent"],
+                0,
+            ),
+        ),
+        "discount_amount": max(
+            0,
+            safe_int(
+                order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "discountAmount": max(
+            0,
+            safe_int(
+                order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "discount": max(
+            0,
+            safe_int(
+                order_row["bonus_used"] or order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "bonus_used": max(
+            0,
+            safe_int(
+                order_row["bonus_used"] or order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "used_bonuses": max(
+            0,
+            safe_int(
+                order_row["bonus_used"] or order_row["discount_amount"],
+                0,
+            ),
+        ),
+        "cashback_percent": max(
+            0,
+            safe_int(order_row["cashback_percent"], 0),
+        ),
+        "cashback_earned": max(
+            0,
+            safe_int(order_row["cashback_earned"], 0),
+        ),
 
-    win = tk.Toplevel(parent)
-    win.title("Montly report — выберите месяц")
-    win.transient(parent)
-    win.grab_set()
+        "total": max(
+            0,
+            safe_int(
+                order_row["total"],
+                0,
+            ),
+        ),
+        "date": created_at,
+        "order_time": order_time,
+        "order_when": safe_str(
+            order_row["order_when"]
+        ),
 
-    tk.Label(win, text="Выберите месяц:").pack(padx=10, pady=(10, 5))
+        "comment": comment,
+        "comments": comment,
+        "comment_text": comment,
+        "note": comment,
+        "notes": comment,
+    }
 
-    listbox = tk.Listbox(win, width=30, height=12)
-    listbox.pack(padx=10, pady=5)
 
-    for y, m in months:
-        listbox.insert(tk.END, f"{calendar.month_name[m]} {y}")
-
-    listbox.selection_set(0)
-
-    def ok():
-        idxs = listbox.curselection()
-        if idxs:
-            selected["month"] = months[idxs[0]]
-        win.destroy()
-
-    def cancel():
-        selected["month"] = None
-        win.destroy()
-
-    buttons = tk.Frame(win)
-    buttons.pack(padx=10, pady=10, fill="x")
-    tk.Button(buttons, text="OK", command=ok).pack(side="left", expand=True, fill="x", padx=3)
-    tk.Button(buttons, text="Cancel", command=cancel).pack(side="left", expand=True, fill="x", padx=3)
-
-    parent.wait_window(win)
-    return selected["month"]
-
-def monthly_report():
-    chosen = select_month_dialog(root)
-    if not chosen:
-        return
-
-    year, month = chosen
-    last_day = calendar.monthrange(year, month)[1]
-    start_date = date(year, month, 1)
-    end_date = date(year, month, last_day)
-
-    all_orders = load_all_orders_for_reports()
-    filtered = [
-        (dt, order, fname)
-        for dt, order, fname in all_orders
-        if dt.year == year and dt.month == month
-    ]
-
-    report = make_report(
-        "MONTHLY REPORT",
-        f"Period: {start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}",
-        filtered
+async def send_payload_to_receipt_program(
+    print_payload: dict,
+    timeout_seconds: int = 12,
+) -> tuple[int, str]:
+    """
+    Отправляет заказ в чековую программу.
+    Возвращает HTTP-код и текст ответа.
+    """
+    timeout = aiohttp.ClientTimeout(
+        total=timeout_seconds
     )
 
-    try:
-        print_report_to_windows_printer(report)
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Печать отчёта: {e}")
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+        async with session.post(
+            PRINT_URL,
+            json=print_payload,
+        ) as response:
+            response_text = await response.text()
+
+            if response.status < 200 or response.status >= 300:
+                raise RuntimeError(
+                    (
+                        f"Чековая программа вернула HTTP "
+                        f"{response.status}: "
+                        f"{response_text[:500]}"
+                    )
+                )
+
+            return (
+                response.status,
+                response_text,
+            )
 
 
-# ===================== ОКНО РУЧНОЙ ПЕЧАТИ СТИКЕРОВ =====================
-def iter_grab_json_files():
-    """Возвращает JSON-файлы из папки GRAB, новые сверху."""
-    files = []
-    try:
-        for path in GRAB_DIR.iterdir():
-            if path.is_file() and path.suffix.lower() == ".json":
-                files.append(path)
-    except Exception as exc:
-        _grab_log(f"Ошибка чтения папки GRAB: {exc}")
+# ============================================================================
+# СТАТИСТИКА
+# ============================================================================
+
+async def build_daily_report() -> str:
+    if not db_pool:
+        raise RuntimeError(
+            "База данных не подключена"
+        )
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            WITH day_bounds AS (
+                SELECT
+                    (
+                        date_trunc(
+                            'day',
+                            NOW()
+                            AT TIME ZONE
+                            'Asia/Bangkok'
+                        )
+                        AT TIME ZONE
+                        'Asia/Bangkok'
+                    ) AS start_utc,
+
+                    (
+                        (
+                            date_trunc(
+                                'day',
+                                NOW()
+                                AT TIME ZONE
+                                'Asia/Bangkok'
+                            )
+                            + INTERVAL '1 day'
+                        )
+                        AT TIME ZONE
+                        'Asia/Bangkok'
+                    ) AS end_utc
+            )
+
+            SELECT
+                (
+                    SELECT COUNT(*)
+                    FROM users
+                ) AS total_users,
+
+                (
+                    SELECT COUNT(*)
+                    FROM users
+                    WHERE is_active = TRUE
+                ) AS active_users,
+
+                (
+                    SELECT COUNT(*)
+                    FROM users
+                    WHERE
+                        is_active = TRUE
+                        AND marketing_allowed = TRUE
+                ) AS marketing_users,
+
+                (
+                    SELECT COUNT(*)
+                    FROM users
+                    WHERE is_active = FALSE
+                ) AS blocked_users,
+
+                (
+                    SELECT COUNT(*)
+                    FROM users u,
+                         day_bounds d
+                    WHERE
+                        u.last_bot_activity_at
+                            >= d.start_utc
+                        AND
+                        u.last_bot_activity_at
+                            < d.end_utc
+                ) AS active_today,
+
+                (
+                    SELECT COUNT(*)
+                    FROM visits v,
+                         day_bounds d
+                    WHERE
+                        v.visited_at
+                            >= d.start_utc
+                        AND
+                        v.visited_at
+                            < d.end_utc
+                ) AS visits,
+
+                (
+                    SELECT COUNT(
+                        DISTINCT telegram_id
+                    )
+                    FROM visits v,
+                         day_bounds d
+                    WHERE
+                        v.visited_at
+                            >= d.start_utc
+                        AND
+                        v.visited_at
+                            < d.end_utc
+                        AND
+                        telegram_id
+                            IS NOT NULL
+                ) AS unique_visitors,
+
+                (
+                    SELECT COUNT(*)
+                    FROM users u,
+                         day_bounds d
+                    WHERE
+                        u.created_at
+                            >= d.start_utc
+                        AND
+                        u.created_at
+                            < d.end_utc
+                ) AS new_users,
+
+                (
+                    SELECT COUNT(*)
+                    FROM orders o,
+                         day_bounds d
+                    WHERE
+                        o.created_at
+                            >= d.start_utc
+                        AND
+                        o.created_at
+                            < d.end_utc
+                ) AS orders_count,
+
+                (
+                    SELECT COUNT(
+                        DISTINCT telegram_id
+                    )
+                    FROM orders o,
+                         day_bounds d
+                    WHERE
+                        o.created_at
+                            >= d.start_utc
+                        AND
+                        o.created_at
+                            < d.end_utc
+                ) AS buyers,
+
+                (
+                    SELECT
+                        COALESCE(
+                            SUM(total),
+                            0
+                        )
+                    FROM orders o,
+                         day_bounds d
+                    WHERE
+                        o.created_at
+                            >= d.start_utc
+                        AND
+                        o.created_at
+                            < d.end_utc
+                ) AS revenue,
+
+                (
+                    SELECT
+                        COALESCE(
+                            AVG(total),
+                            0
+                        )
+                    FROM orders o,
+                         day_bounds d
+                    WHERE
+                        o.created_at
+                            >= d.start_utc
+                        AND
+                        o.created_at
+                            < d.end_utc
+                ) AS avg_check
+            """
+        )
+
+    visits = int(
+        row["visits"]
+        or 0
+    )
+
+    unique_visitors = int(
+        row["unique_visitors"]
+        or 0
+    )
+
+    orders_count = int(
+        row["orders_count"]
+        or 0
+    )
+
+    conversion = (
+        orders_count
+        / unique_visitors
+        * 100
+        if unique_visitors
+        else 0
+    )
+
+    today = datetime.now(
+        TIMEZONE
+    ).strftime(
+        "%d.%m.%Y"
+    )
+
+    return (
+        f"📊 Статистика за {today}\n\n"
+
+        f"👥 Всего ID в базе: "
+        f"{int(row['total_users'] or 0)}\n"
+
+        f"✅ Активных пользователей: "
+        f"{int(row['active_users'] or 0)}\n"
+
+        f"📣 Доступно для рекламы: "
+        f"{int(row['marketing_users'] or 0)}\n"
+
+        f"🚫 Заблокировали/недоступны: "
+        f"{int(row['blocked_users'] or 0)}\n"
+
+        f"💬 Пользователей бота сегодня: "
+        f"{int(row['active_today'] or 0)}\n"
+
+        f"🆕 Новых пользователей: "
+        f"{int(row['new_users'] or 0)}\n\n"
+
+        f"Открытий сайта: {visits}\n"
+
+        f"Уникальных посетителей: "
+        f"{unique_visitors}\n\n"
+
+        f"Заказов: {orders_count}\n"
+
+        f"Покупателей: "
+        f"{int(row['buyers'] or 0)}\n"
+
+        f"Конверсия: "
+        f"{conversion:.1f}%\n\n"
+
+        f"Выручка: "
+        f"{int(row['revenue'] or 0)} ฿\n"
+
+        f"Средний чек: "
+        f"{round(float(row['avg_check'] or 0))} ฿"
+    )
+
+
+# ============================================================================
+# РАССЫЛКИ
+# ============================================================================
+
+async def get_broadcast_targets(
+    broadcast_type: str,
+) -> list[asyncpg.Record]:
+    if not db_pool:
         return []
 
-    def sort_key(path: Path):
-        try:
-            return path.stat().st_mtime
-        except Exception:
-            return 0
-
-    files.sort(key=sort_key, reverse=True)
-    return files
-
-
-def read_grab_json_order_number(json_path: Path) -> str:
-    """Читает номер заказа из выбранного JSON и проверяет формат."""
-    with Path(json_path).open("r", encoding="utf-8-sig") as handle:
-        data = json.load(handle)
-
-    order_number = str(
-        data.get("order_number")
-        or data.get("orderNumber")
-        or data.get("order_no")
-        or data.get("orderNo")
-        or data.get("number")
-        or ""
-    ).strip().upper()
-
-    if not validate_grab_order_number(order_number):
-        raise ValueError(
-            "В выбранном JSON нет номера формата GF-342 или SM-472."
+    if broadcast_type == "advertising":
+        return await db_pool.fetch(
+            """
+            SELECT
+                telegram_id,
+                username,
+                telegram_first_name,
+                telegram_last_name
+            FROM users
+            WHERE
+                is_active = TRUE
+                AND marketing_allowed = TRUE
+                AND telegram_id <> $1
+            ORDER BY telegram_id
+            """,
+            ADMIN_CHAT_ID,
         )
 
-    return order_number
-
-
-def queue_existing_grab_json(json_path: Path) -> str:
-    """
-    Ставит на печать уже существующий JSON из папки GRAB.
-    Новый JSON не создаётся, чековая часть программы не затрагивается.
-    """
-    json_path = Path(json_path)
-    order_number = read_grab_json_order_number(json_path)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    image_path = GRAB_DIR / f"{json_path.stem}_manual_{stamp}.png"
-
-    GRAB_PRINT_QUEUE.put(
-        {
-            "order_number": order_number,
-            "json_path": json_path,
-            "image_path": image_path,
-        }
+    return await db_pool.fetch(
+        """
+        SELECT
+            telegram_id,
+            username,
+            telegram_first_name,
+            telegram_last_name
+        FROM users
+        WHERE
+            is_active = TRUE
+            AND telegram_id <> $1
+        ORDER BY telegram_id
+        """,
+        ADMIN_CHAT_ID,
     )
-    return order_number
 
 
-def open_sticker_window():
-    """Открывает список JSON из GRAB и позволяет повторно печатать выбранный стикер."""
-    win = tk.Toplevel(root)
-    win.title("Sticker")
-    win.transient(root)
-    win.geometry("780x500")
-    win.minsize(680, 420)
-
-    main = tk.Frame(win)
-    main.pack(fill="both", expand=True, padx=10, pady=10)
-
-    left = tk.Frame(main)
-    left.pack(side="left", fill="y")
-
-    tk.Label(left, text="GRAB JSON").pack(anchor="w")
-
-    list_frame = tk.Frame(left)
-    list_frame.pack(fill="both", expand=True, pady=(5, 0))
-
-    sticker_listbox = tk.Listbox(
-        list_frame,
-        width=42,
-        height=22,
-        exportselection=False,
+async def get_broadcast_target_count(
+    broadcast_type: str,
+) -> int:
+    targets = await get_broadcast_targets(
+        broadcast_type
     )
-    sticker_scrollbar = tk.Scrollbar(
-        list_frame,
-        orient="vertical",
-        command=sticker_listbox.yview,
+
+    return len(
+        targets
     )
-    sticker_listbox.configure(yscrollcommand=sticker_scrollbar.set)
-    sticker_listbox.pack(side="left", fill="both", expand=True)
-    sticker_scrollbar.pack(side="right", fill="y")
 
-    right = tk.Frame(main)
-    right.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
-    tk.Label(right, text="Содержимое выбранного JSON").pack(anchor="w")
+async def create_broadcast_log(
+    broadcast_type: str,
+    source_chat_id: int | None,
+    source_message_id: int | None,
+    total_targets: int,
+) -> int:
+    if not db_pool:
+        return 0
 
-    json_text = tk.Text(right, wrap="word", state="disabled")
-    json_text.pack(fill="both", expand=True, pady=(5, 0))
+    log_id = await db_pool.fetchval(
+        """
+        INSERT INTO broadcast_logs (
+            broadcast_type,
+            created_by,
+            source_chat_id,
+            source_message_id,
+            total_targets,
+            status
+        )
+        VALUES (
+            $1,$2,$3,$4,$5,
+            'running'
+        )
+        RETURNING id
+        """,
+        broadcast_type,
+        ADMIN_CHAT_ID,
+        source_chat_id,
+        source_message_id,
+        total_targets,
+    )
 
-    status_var_sticker = tk.StringVar(value="")
-    tk.Label(
-        win,
-        textvariable=status_var_sticker,
-        anchor="w",
-        fg="gray",
-    ).pack(fill="x", padx=10)
+    return int(
+        log_id
+    )
 
-    buttons = tk.Frame(win)
-    buttons.pack(fill="x", padx=10, pady=(5, 10))
 
-    grab_files = []
+async def finish_broadcast_log(
+    log_id: int,
+    delivered: int,
+    blocked: int,
+    failed: int,
+    status: str,
+) -> None:
+    if (
+        not db_pool
+        or not log_id
+    ):
+        return
 
-    def show_text(value: str):
-        json_text.configure(state="normal")
-        json_text.delete("1.0", tk.END)
-        json_text.insert(tk.END, value)
-        json_text.configure(state="disabled")
+    await db_pool.execute(
+        """
+        UPDATE broadcast_logs
+        SET
+            delivered = $2,
+            blocked = $3,
+            failed = $4,
+            status = $5,
+            completed_at = NOW()
+        WHERE id = $1
+        """,
+        log_id,
+        delivered,
+        blocked,
+        failed,
+        status,
+    )
 
-    def selected_path():
-        selected = sticker_listbox.curselection()
-        if not selected:
-            return None
-        index = selected[0]
-        if index < 0 or index >= len(grab_files):
-            return None
-        return grab_files[index]
 
-    def show_selected(_event=None):
-        path = selected_path()
-        if path is None:
-            show_text("")
-            return
-
-        try:
-            with path.open("r", encoding="utf-8-sig") as handle:
-                data = json.load(handle)
-            show_text(json.dumps(data, ensure_ascii=False, indent=2))
-        except Exception:
-            try:
-                show_text(path.read_text(encoding="utf-8-sig", errors="replace"))
-            except Exception as exc:
-                show_text(f"Ошибка открытия файла:\n{exc}")
-
-    def refresh_grab_list(select_first=True):
-        nonlocal grab_files
-        grab_files = iter_grab_json_files()
-        sticker_listbox.delete(0, tk.END)
-
-        for path in grab_files:
-            try:
-                number = read_grab_json_order_number(path)
-                display_name = f"{number}   |   {path.name}"
-            except Exception:
-                display_name = f"ОШИБКА JSON   |   {path.name}"
-            sticker_listbox.insert(tk.END, display_name)
-
-        status_var_sticker.set(
-            f"Папка: {GRAB_DIR} | JSON: {len(grab_files)}"
+async def send_advertising_message(
+    telegram_id: int,
+    source_chat_id: int,
+    source_message_id: int,
+) -> str:
+    try:
+        await bot.copy_message(
+            chat_id=telegram_id,
+            from_chat_id=source_chat_id,
+            message_id=source_message_id,
+            reply_markup=(
+                build_unsubscribe_keyboard()
+            ),
         )
 
-        if grab_files and select_first:
-            sticker_listbox.selection_set(0)
-            sticker_listbox.activate(0)
-            sticker_listbox.see(0)
-            show_selected()
-        elif not grab_files:
-            show_text("В папке GRAB пока нет JSON-файлов.")
+        await mark_send_success(
+            telegram_id,
+            "broadcast",
+        )
 
-    def print_selected_sticker(_event=None):
-        path = selected_path()
-        if path is None:
-            messagebox.showwarning(
-                "Sticker",
-                "Выберите JSON-файл из списка.",
-                parent=win,
+        return "delivered"
+
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(
+            float(
+                exc.retry_after
             )
-            return
+            + 1
+        )
+
+        return await send_advertising_message(
+            telegram_id,
+            source_chat_id,
+            source_message_id,
+        )
+
+    except Exception as exc:
+        blocked = is_blocking_error(
+            exc
+        )
+
+        await mark_send_error(
+            telegram_id,
+            str(exc),
+            blocked,
+        )
+
+        if blocked:
+            return "blocked"
+
+        logger.warning(
+            "BROADCAST SEND ERROR: user=%s error=%s",
+            telegram_id,
+            exc,
+        )
+
+        return "failed"
+
+
+async def send_new_keyboard(
+    user_row: asyncpg.Record,
+) -> str:
+    telegram_id = int(
+        user_row[
+            "telegram_id"
+        ]
+    )
+
+    try:
+        telegram_user = (
+            make_user_from_database(
+                user_row
+            )
+        )
+
+        await bot.send_message(
+            telegram_id,
+            (
+                "🔄 Меню Smoke Factory BBQ обновлено.\n"
+                "Используйте новую кнопку ниже 👇"
+            ),
+            reply_markup=start_keyboard(
+                telegram_user
+            ),
+        )
+
+        await mark_send_success(
+            telegram_id,
+            "keyboard",
+        )
+
+        return "delivered"
+
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(
+            float(
+                exc.retry_after
+            )
+            + 1
+        )
+
+        return await send_new_keyboard(
+            user_row
+        )
+
+    except Exception as exc:
+        blocked = is_blocking_error(
+            exc
+        )
+
+        await mark_send_error(
+            telegram_id,
+            str(exc),
+            blocked,
+        )
+
+        if blocked:
+            return "blocked"
+
+        logger.warning(
+            "KEYBOARD SEND ERROR: user=%s error=%s",
+            telegram_id,
+            exc,
+        )
+
+        return "failed"
+
+
+async def run_broadcast(
+    broadcast_type: str,
+    source_chat_id: int | None = None,
+    source_message_id: int | None = None,
+) -> None:
+    global broadcast_running
+
+    if broadcast_lock.locked():
+        await bot.send_message(
+            ADMIN_CHAT_ID,
+            "⚠️ Другая рассылка уже выполняется.",
+        )
+
+        return
+
+    async with broadcast_lock:
+        broadcast_running = True
+
+        delivered = 0
+        blocked = 0
+        failed = 0
+        log_id = 0
 
         try:
-            order_number = queue_existing_grab_json(path)
-            status_var_sticker.set(
-                f"Стикер {order_number} поставлен в очередь печати."
+            targets = await get_broadcast_targets(
+                broadcast_type
             )
-            messagebox.showinfo(
-                "Sticker",
-                f"Стикер {order_number} отправлен на печать.",
-                parent=win,
+
+            total = len(
+                targets
             )
+
+            log_id = await create_broadcast_log(
+                broadcast_type,
+                source_chat_id,
+                source_message_id,
+                total,
+            )
+
+            progress_message = await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    "🚀 Рассылка запущена\n\n"
+                    f"Получателей: {total}\n"
+                    "Обработано: 0"
+                ),
+            )
+
+            for index, user_row in enumerate(
+                targets,
+                start=1,
+            ):
+                telegram_id = int(
+                    user_row[
+                        "telegram_id"
+                    ]
+                )
+
+                if broadcast_type == "advertising":
+                    if (
+                        source_chat_id is None
+                        or source_message_id is None
+                    ):
+                        raise RuntimeError(
+                            "Не найдено сообщение для рассылки"
+                        )
+
+                    result = await send_advertising_message(
+                        telegram_id,
+                        source_chat_id,
+                        source_message_id,
+                    )
+
+                else:
+                    result = await send_new_keyboard(
+                        user_row
+                    )
+
+                if result == "delivered":
+                    delivered += 1
+
+                elif result == "blocked":
+                    blocked += 1
+
+                else:
+                    failed += 1
+
+                if (
+                    index % 25 == 0
+                    or index == total
+                ):
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=ADMIN_CHAT_ID,
+                            message_id=(
+                                progress_message
+                                .message_id
+                            ),
+                            text=(
+                                "🚀 Рассылка выполняется\n\n"
+                                f"Получателей: {total}\n"
+                                f"Обработано: {index}\n"
+                                f"Доставлено: {delivered}\n"
+                                f"Недоступны: {blocked}\n"
+                                f"Другие ошибки: {failed}"
+                            ),
+                        )
+
+                    except TelegramBadRequest:
+                        pass
+
+                await asyncio.sleep(
+                    BROADCAST_DELAY
+                )
+
+            await finish_broadcast_log(
+                log_id,
+                delivered,
+                blocked,
+                failed,
+                "completed",
+            )
+
+            result_text = (
+                "✅ Рассылка завершена\n\n"
+                f"Всего получателей: {total}\n"
+                f"Доставлено: {delivered}\n"
+                f"Недоступны: {blocked}\n"
+                f"Другие ошибки: {failed}"
+            )
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=(
+                        progress_message
+                        .message_id
+                    ),
+                    text=result_text,
+                )
+
+            except TelegramBadRequest:
+                await bot.send_message(
+                    ADMIN_CHAT_ID,
+                    result_text,
+                )
+
         except Exception as exc:
-            _grab_log(
-                "Ошибка ручной печати Grab-этикетки: "
-                f"{exc}\n{traceback.format_exc()}"
-            )
-            messagebox.showerror(
-                "Sticker",
-                f"Не удалось напечатать выбранный стикер:\n{exc}",
-                parent=win,
+            logger.exception(
+                "MASS BROADCAST ERROR"
             )
 
-    sticker_listbox.bind("<<ListboxSelect>>", show_selected)
-    sticker_listbox.bind("<Double-Button-1>", print_selected_sticker)
+            await finish_broadcast_log(
+                log_id,
+                delivered,
+                blocked,
+                failed,
+                "failed",
+            )
 
-    tk.Button(
-        buttons,
-        text="Обновить",
-        command=refresh_grab_list,
-    ).pack(side="left", padx=(0, 5))
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    "⚠️ Рассылка остановлена.\n\n"
+                    f"Ошибка: {exc}"
+                ),
+            )
 
-    tk.Button(
-        buttons,
-        text="Печать",
-        command=print_selected_sticker,
-        font=("Arial", 10, "bold"),
-    ).pack(side="left", fill="x", expand=True, padx=5)
+        finally:
+            broadcast_running = False
 
-    tk.Button(
-        buttons,
-        text="Закрыть",
-        command=win.destroy,
-    ).pack(side="right", padx=(5, 0))
 
-    refresh_grab_list()
+# ============================================================================
+# КОМАНДА /bonus
+# ============================================================================
 
-# Кнопки
-tk.Button(frame, text="🔄 Обновить", command=refresh_order_list).grid(row=1, column=1, sticky="ew", pady=5)
-tk.Button(frame, text="💾 Сохранить", command=save_edited_order).grid(row=1, column=2, sticky="ew", pady=5)
-tk.Button(frame, text="🖨️ Печать", command=print_selected_order).grid(row=1, column=3, sticky="ew", pady=5)
-tk.Button(frame, text="❌ Аннулировать", command=delete_selected_order).grid(row=1, column=4, sticky="ew", pady=5)
+def make_bonus_request_payload(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+    timestamp: int,
+    request_id: str,
+) -> str:
+    return json.dumps(
+        {
+            "amount": amount,
+            "managerId": manager_id,
+            "requestId": request_id,
+            "telegramId": str(
+                telegram_id
+            ),
+            "timestamp": timestamp,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
-tk.Button(frame, text="➕ Добавить блюдо", command=add_dish).grid(row=2, column=1, columnspan=1, sticky="ew", pady=5)
-tk.Button(frame, text="5% скидка", command=lambda: apply_discount(5)).grid(row=2, column=2, sticky="ew", pady=5)
-tk.Button(frame, text="10% скидка", command=lambda: apply_discount(10)).grid(row=2, column=3, sticky="ew", pady=5)
-tk.Button(frame, text="40% скидка", command=lambda: apply_discount(40)).grid(row=2, column=4, sticky="ew", pady=5)
 
-# Кнопки отчётов
-tk.Button(frame, text="Daily report", command=daily_report).grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
-tk.Button(frame, text="Montly report", command=monthly_report).grid(row=3, column=3, columnspan=2, sticky="ew", pady=5)
+async def update_bonus_in_mini_app(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+    request_id: str,
+) -> dict:
+    timestamp = int(
+        time.time()
+    )
 
-# Ручная повторная печать этикеток из папки GRAB
-tk.Button(frame, text="Sticker", command=open_sticker_window).grid(row=4, column=1, columnspan=4, sticky="ew", pady=5)
+    payload_string = make_bonus_request_payload(
+        telegram_id,
+        amount,
+        manager_id,
+        timestamp,
+        request_id,
+    )
 
-refresh_order_list()
+    signature = hmac.new(
+        API_TOKEN.encode(
+            "utf-8"
+        ),
+        payload_string.encode(
+            "utf-8"
+        ),
+        hashlib.sha256,
+    ).hexdigest()
 
-# Запуск очереди Grab-печати в фоне.
-# Автопечать и ручная печать из окна Sticker используют одну последовательную очередь.
-grab_worker_thread = threading.Thread(
-    target=grab_print_worker,
-    name="grab-label-printer",
-    daemon=True,
+    request_body = {
+        "telegramId": str(
+            telegram_id
+        ),
+        "amount": amount,
+        "managerId": manager_id,
+        "timestamp": timestamp,
+        "requestId": request_id,
+    }
+
+    url = (
+        f"{WEBAPP_URL}/api/admin/bonus"
+    )
+
+    timeout = aiohttp.ClientTimeout(
+        total=15
+    )
+
+    async with aiohttp.ClientSession(
+        timeout=timeout
+    ) as session:
+        async with session.post(
+            url,
+            json=request_body,
+            headers={
+                "X-Bonus-Signature":
+                    signature,
+            },
+        ) as response:
+            response_text = (
+                await response.text()
+            )
+
+            try:
+                response_data = json.loads(
+                    response_text
+                )
+
+            except Exception:
+                response_data = {
+                    "ok": False,
+                    "error": response_text,
+                }
+
+            if (
+                response.status != 200
+                or not response_data.get(
+                    "ok"
+                )
+            ):
+                raise RuntimeError(
+                    response_data.get(
+                        "error"
+                    )
+                    or (
+                        "Mini App вернул ошибку "
+                        f"HTTP {response.status}"
+                    )
+                )
+
+            return response_data
+
+
+async def save_bonus_in_bot_database(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+    request_id: str,
+) -> int:
+    if not db_pool:
+        raise RuntimeError(
+            "База данных бота не подключена"
+        )
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            previous_amount = await conn.fetchval(
+                """
+                SELECT manual_spend
+                FROM users
+                WHERE telegram_id = $1
+                """,
+                telegram_id,
+            )
+
+            previous_amount = int(
+                previous_amount
+                or 0
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO users (
+                    telegram_id,
+                    manual_spend,
+                    bonus_updated_at,
+                    bonus_updated_by,
+                    created_at,
+                    updated_at
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    NOW(),
+                    $3,
+                    NOW(),
+                    NOW()
+                )
+
+                ON CONFLICT (telegram_id)
+                DO UPDATE SET
+                    manual_spend =
+                        EXCLUDED.manual_spend,
+
+                    bonus_updated_at =
+                        NOW(),
+
+                    bonus_updated_by =
+                        EXCLUDED.bonus_updated_by,
+
+                    updated_at =
+                        NOW()
+                """,
+                telegram_id,
+                amount,
+                manager_id,
+            )
+
+            await conn.execute(
+                """
+                INSERT INTO loyalty_adjustments (
+                    request_id,
+                    telegram_id,
+                    previous_amount,
+                    new_amount,
+                    created_by,
+                    source
+                )
+                VALUES (
+                    $1,$2,$3,$4,$5,
+                    'manager_bonus'
+                )
+
+                ON CONFLICT (request_id)
+                DO NOTHING
+                """,
+                request_id,
+                telegram_id,
+                previous_amount,
+                amount,
+                manager_id,
+            )
+
+            return previous_amount
+
+
+async def apply_manager_bonus(
+    telegram_id: int,
+    amount: int,
+    manager_id: int,
+) -> dict:
+    request_id = (
+        f"bonus:{manager_id}:"
+        f"{telegram_id}:"
+        f"{amount}:"
+        f"{time.time_ns()}"
+    )
+
+    mini_app_result = (
+        await update_bonus_in_mini_app(
+            telegram_id,
+            amount,
+            manager_id,
+            request_id,
+        )
+    )
+
+    previous_local = (
+        await save_bonus_in_bot_database(
+            telegram_id,
+            amount,
+            manager_id,
+            request_id,
+        )
+    )
+
+    mini_app_result[
+        "previousLocalAmount"
+    ] = previous_local
+
+    return mini_app_result
+
+
+async def notify_user_about_bonus(
+    telegram_id: int,
+    total_spend: int,
+    discount_percent: int,
+) -> str:
+    try:
+        await bot.send_message(
+            telegram_id,
+            (
+                "🎁 Ваша накопленная сумма "
+                "в программе лояльности обновлена.\n\n"
+
+                f"Накопленная сумма: "
+                f"{total_spend:,} ฿\n"
+
+                f"Текущая скидка: "
+                f"{discount_percent}%\n\n"
+
+                "Информация уже доступна "
+                "в личном кабинете."
+            ).replace(
+                ",",
+                " ",
+            ),
+        )
+
+        await mark_send_success(
+            telegram_id,
+            "direct",
+        )
+
+        return "sent"
+
+    except Exception as exc:
+        blocked = is_blocking_error(
+            exc
+        )
+
+        await mark_send_error(
+            telegram_id,
+            str(exc),
+            blocked,
+        )
+
+        return (
+            "blocked"
+            if blocked
+            else "failed"
+        )
+
+
+async def process_bonus_amount(
+    message: types.Message,
+    telegram_id: int,
+    amount: int,
+) -> None:
+    await message.answer(
+        (
+            "⏳ Сохраняю сумму "
+            "в личный кабинет...\n\n"
+
+            f"Telegram ID: {telegram_id}\n"
+
+            f"Ручная сумма: "
+            f"{amount:,} ฿"
+        ).replace(
+            ",",
+            " ",
+        )
+    )
+
+    try:
+        result = await apply_manager_bonus(
+            telegram_id,
+            amount,
+            message.from_user.id,
+        )
+
+        manual_spend = int(
+            result.get(
+                "manualSpend",
+                amount,
+            )
+            or amount
+        )
+
+        order_spend = int(
+            result.get(
+                "orderSpend",
+                0,
+            )
+            or 0
+        )
+
+        total_spend = int(
+            result.get(
+                "totalSpend",
+                manual_spend
+                + order_spend,
+            )
+            or 0
+        )
+
+        discount_percent = int(
+            result.get(
+                "discountPercent",
+                discount_by_spend(
+                    total_spend
+                ),
+            )
+            or 0
+        )
+
+        notification_status = (
+            await notify_user_about_bonus(
+                telegram_id,
+                total_spend,
+                discount_percent,
+            )
+        )
+
+        notification_text = {
+            "sent":
+                "Пользователь уведомлён.",
+
+            "blocked":
+                (
+                    "Пользователь заблокировал бота, "
+                    "но сумма в ЛК сохранена."
+                ),
+
+            "failed":
+                (
+                    "Сумма сохранена, но уведомление "
+                    "отправить не удалось."
+                ),
+        }.get(
+            notification_status,
+            "Статус уведомления неизвестен.",
+        )
+
+        await message.answer(
+            (
+                "✅ Сумма сохранена "
+                "в личном кабинете\n\n"
+
+                f"Telegram ID: "
+                f"{telegram_id}\n"
+
+                f"Фактические заказы: "
+                f"{order_spend:,} ฿\n"
+
+                f"Ручная сумма: "
+                f"{manual_spend:,} ฿\n"
+
+                f"Общая накопленная сумма: "
+                f"{total_spend:,} ฿\n"
+
+                f"Уровень скидки: "
+                f"{discount_percent}%\n\n"
+
+                f"{notification_text}"
+            ).replace(
+                ",",
+                " ",
+            )
+        )
+
+        waiting_bonus.pop(
+            message.from_user.id,
+            None,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "BONUS SAVE ERROR"
+        )
+
+        await message.answer(
+            (
+                "⚠️ Не удалось сохранить сумму.\n\n"
+
+                f"Ошибка: {exc}\n\n"
+
+                "Можно повторно отправить сумму "
+                "или выполнить /cancel."
+            )
+        )
+
+
+# ============================================================================
+# ПОЛЬЗОВАТЕЛЬСКИЕ КОМАНДЫ
+# ============================================================================
+
+@dp.message(
+    Command("start")
 )
-grab_worker_thread.start()
+async def cmd_start(
+    message: types.Message,
+) -> None:
+    await upsert_user(
+        message.from_user
+    )
 
-# Запуск HTTP-приёмника в фоне
-srv_thread = threading.Thread(target=run_receiver, name="order-receiver", daemon=True)
-srv_thread.start()
+    await send_main_keyboard(
+        message,
+        (
+            "Нажмите кнопку ниже, "
+            "чтобы открыть меню.\n"
 
-# GUI mainloop
-root.mainloop()
+            "Если есть вопросы — нажмите "
+            "«💬 Задать вопрос менеджеру».\n\n"
+
+            "Отключить рекламу: /stop"
+        ),
+        force=True,
+    )
+
+
+@dp.message(
+    Command("stop")
+)
+async def cmd_stop_ads(
+    message: types.Message,
+) -> None:
+    await set_marketing_allowed(
+        message.from_user.id,
+        False,
+    )
+
+    await message.answer(
+        (
+            "🔕 Рекламные сообщения отключены.\n\n"
+
+            "Сообщения о заказах и обновления меню "
+            "продолжат приходить.\n\n"
+
+            "Включить рекламу снова: /ads_on"
+        ),
+        reply_markup=start_keyboard(
+            message.from_user
+        ),
+    )
+
+
+@dp.message(
+    Command("ads_on")
+)
+async def cmd_ads_on(
+    message: types.Message,
+) -> None:
+    await set_marketing_allowed(
+        message.from_user.id,
+        True,
+    )
+
+    await message.answer(
+        "🔔 Рекламные сообщения включены.",
+        reply_markup=start_keyboard(
+            message.from_user
+        ),
+    )
+
+
+@dp.callback_query(
+    F.data == "unsubscribe_ads"
+)
+async def callback_unsubscribe_ads(
+    call: types.CallbackQuery,
+) -> None:
+    await set_marketing_allowed(
+        call.from_user.id,
+        False,
+    )
+
+    await call.answer(
+        "Рекламные сообщения отключены",
+        show_alert=True,
+    )
+
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(
+    F.text == MENU_BTN_TEXT
+)
+async def refresh_menu_keyboard(
+    message: types.Message,
+) -> None:
+    await message.answer(
+        (
+            "✅ Кнопка меню обновлена. "
+            "Нажмите её ещё раз."
+        ),
+        reply_markup=updated_keyboard(
+            message.from_user
+        ),
+    )
+
+    KEYBOARD_SHOWN_USERS.add(
+        message.from_user.id
+    )
+
+
+@dp.message(
+    F.text == ASK_BTN_TEXT
+)
+async def open_manager_chat(
+    message: types.Message,
+) -> None:
+    kb = InlineKeyboardBuilder()
+
+    kb.button(
+        text="👉 Открыть чат менеджера",
+        url=MANAGER_URL,
+    )
+
+    kb.button(
+        text="⬅️ Назад в меню",
+        callback_data="back_to_menu",
+    )
+
+    kb.adjust(1)
+
+    await message.answer(
+        "Открой чат менеджера по кнопке ниже 👇",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@dp.callback_query(
+    F.data == "back_to_menu"
+)
+async def back_to_menu(
+    call: types.CallbackQuery,
+) -> None:
+    await call.message.answer(
+        "Ок. Возвращаю кнопки меню 👇",
+        reply_markup=start_keyboard(
+            call.from_user
+        ),
+    )
+
+    KEYBOARD_SHOWN_USERS.add(
+        call.from_user.id
+    )
+
+    await call.answer()
+
+
+# ============================================================================
+# АДМИНИСТРАТИВНЫЕ КОМАНДЫ
+# ============================================================================
+
+@dp.message(
+    Command("adminhelp")
+)
+async def cmd_admin_help(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await message.answer(
+        (
+            "🛠 Команды администратора\n\n"
+
+            "/nu4etam — общая статистика\n"
+
+            "/users — пользователи бота\n"
+
+            "/checkuser ID — проверить ID\n"
+
+            "/export_users — выгрузить CSV\n"
+
+            "/broadcast — создать рекламу\n"
+
+            "/broadcast_history — история рассылок\n"
+
+            "/update_keyboard — обновить клавиатуру всем\n"
+
+            "/bonus — установить ручную накопленную сумму\n"
+
+            "/cancel — отменить текущее действие"
+        )
+    )
+
+
+@dp.message(
+    Command("bonus")
+)
+async def cmd_bonus(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    parts = (
+        message.text
+        or ""
+    ).split()
+
+    if len(parts) >= 3:
+        try:
+            telegram_id = int(
+                parts[1]
+            )
+
+        except ValueError:
+            await message.answer(
+                "Telegram ID должен состоять из цифр."
+            )
+            return
+
+        amount = parse_money_amount(
+            "".join(
+                parts[2:]
+            )
+        )
+
+        if amount is None:
+            await message.answer(
+                "Сумма указана неправильно."
+            )
+            return
+
+        await process_bonus_amount(
+            message,
+            telegram_id,
+            amount,
+        )
+
+        return
+
+    waiting_bonus[
+        message.from_user.id
+    ] = {
+        "stage": "telegram_id"
+    }
+
+    await message.answer(
+        (
+            "🎁 Ручная сумма лояльности\n\n"
+
+            "Пришли Telegram ID и сумму.\n\n"
+
+            "Можно одним сообщением:\n"
+
+            "123456789 5000\n\n"
+
+            "Или сначала ID, "
+            "а следующим сообщением сумму.\n\n"
+
+            "Сумма заменит прежнюю ручную сумму. "
+            "Фактические заказы не изменятся.\n\n"
+
+            "Для сброса укажи 0.\n"
+
+            "Отмена: /cancel"
+        )
+    )
+
+
+@dp.message(
+    Command("nu4etam")
+)
+async def cmd_daily_report(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    try:
+        await message.answer(
+            await build_daily_report()
+        )
+
+    except Exception:
+        logger.exception(
+            "Ошибка формирования отчёта"
+        )
+
+        await message.answer(
+            "⚠️ Не удалось сформировать отчёт."
+        )
+
+
+@dp.message(
+    Command("users")
+)
+async def cmd_users(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if not db_pool:
+        await message.answer(
+            "База данных не подключена."
+        )
+        return
+
+    stats = await db_pool.fetchrow(
+        """
+        SELECT
+            COUNT(*) AS total,
+
+            COUNT(*) FILTER (
+                WHERE is_active = TRUE
+            ) AS active,
+
+            COUNT(*) FILTER (
+                WHERE
+                    is_active = TRUE
+                    AND marketing_allowed = TRUE
+            ) AS advertising,
+
+            COUNT(*) FILTER (
+                WHERE marketing_allowed = FALSE
+            ) AS unsubscribed,
+
+            COUNT(*) FILTER (
+                WHERE is_active = FALSE
+            ) AS blocked
+
+        FROM users
+        """
+    )
+
+    recent_users = await db_pool.fetch(
+        """
+        SELECT
+            telegram_id,
+            username,
+            telegram_first_name,
+            telegram_last_name,
+            is_active,
+            marketing_allowed,
+            manual_spend,
+            last_bot_activity_at
+
+        FROM users
+
+        ORDER BY
+            last_bot_activity_at
+            DESC NULLS LAST
+
+        LIMIT 15
+        """
+    )
+
+    lines = [
+        "👥 Пользователи бота",
+        "",
+        f"Всего ID: {int(stats['total'] or 0)}",
+        f"Активных: {int(stats['active'] or 0)}",
+        f"Для рекламы: {int(stats['advertising'] or 0)}",
+        (
+            "Отказались от рекламы: "
+            f"{int(stats['unsubscribed'] or 0)}"
+        ),
+        f"Недоступны: {int(stats['blocked'] or 0)}",
+        "",
+        "Последние 15:",
+    ]
+
+    for user in recent_users:
+        full_name = " ".join(
+            part
+            for part in (
+                user[
+                    "telegram_first_name"
+                ],
+                user[
+                    "telegram_last_name"
+                ],
+            )
+            if part
+        ).strip()
+
+        username = (
+            f"@{user['username']}"
+            if user["username"]
+            else "без username"
+        )
+
+        active_icon = (
+            "✅"
+            if user["is_active"]
+            else "🚫"
+        )
+
+        ads_icon = (
+            "📣"
+            if user[
+                "marketing_allowed"
+            ]
+            else "🔕"
+        )
+
+        manual_spend = int(
+            user[
+                "manual_spend"
+            ]
+            or 0
+        )
+
+        lines.append(
+            (
+                f"{active_icon}{ads_icon} "
+                f"{user['telegram_id']} — "
+                f"{full_name or 'Без имени'} — "
+                f"{username} — "
+                f"ручная сумма {manual_spend} ฿"
+            )
+        )
+
+    await message.answer(
+        "\n".join(
+            lines
+        )[:4096]
+    )
+
+
+@dp.message(
+    Command("checkuser")
+)
+async def cmd_check_user(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if not db_pool:
+        return
+
+    parts = (
+        message.text
+        or ""
+    ).split(
+        maxsplit=1
+    )
+
+    if len(parts) != 2:
+        await message.answer(
+            "Использование:\n/checkuser 123456789"
+        )
+        return
+
+    try:
+        telegram_id = int(
+            parts[1].strip()
+        )
+
+    except ValueError:
+        await message.answer(
+            "Telegram ID должен состоять из цифр."
+        )
+        return
+
+    user = await db_pool.fetchrow(
+        """
+        SELECT *
+        FROM users
+        WHERE telegram_id = $1
+        """,
+        telegram_id,
+    )
+
+    if not user:
+        await message.answer(
+            f"❌ Пользователь {telegram_id} не найден."
+        )
+        return
+
+    full_name = " ".join(
+        part
+        for part in (
+            user[
+                "telegram_first_name"
+            ],
+            user[
+                "telegram_last_name"
+            ],
+        )
+        if part
+    ).strip()
+
+    await message.answer(
+        (
+            "✅ Пользователь найден\n\n"
+
+            f"Telegram ID: "
+            f"{user['telegram_id']}\n"
+
+            f"Username: "
+            f"@{user['username'] or '-'}\n"
+
+            f"Имя Telegram: "
+            f"{full_name or '-'}\n"
+
+            f"Имя в заказе: "
+            f"{user['profile_name'] or '-'}\n"
+
+            f"Телефон: "
+            f"{user['phone'] or '-'}\n"
+
+            f"Адрес: "
+            f"{user['address'] or '-'}\n"
+
+            f"Ручная сумма: "
+            f"{int(user['manual_spend'] or 0)} ฿\n"
+
+            f"Обновил сумму: "
+            f"{user['bonus_updated_by'] or '-'}\n"
+
+            f"Дата обновления: "
+            f"{user['bonus_updated_at'] or '-'}\n"
+
+            f"Активен: "
+            f"{'да' if user['is_active'] else 'нет'}\n"
+
+            f"Реклама разрешена: "
+            f"{'да' if user['marketing_allowed'] else 'нет'}\n"
+
+            f"Создан: "
+            f"{user['created_at']}\n"
+
+            f"Последняя активность: "
+            f"{user['last_bot_activity_at'] or '-'}\n"
+
+            f"Последняя успешная отправка: "
+            f"{user['last_successful_send_at'] or '-'}\n"
+
+            f"Заблокирован: "
+            f"{user['blocked_at'] or '-'}\n"
+
+            f"Последняя ошибка: "
+            f"{user['last_send_error'] or '-'}"
+        )
+    )
+
+
+@dp.message(
+    Command("export_users")
+)
+async def cmd_export_users(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if not db_pool:
+        return
+
+    users = await db_pool.fetch(
+        """
+        SELECT
+            telegram_id,
+            username,
+            telegram_first_name,
+            telegram_last_name,
+            profile_name,
+            phone,
+            address,
+            manual_spend,
+            bonus_updated_at,
+            bonus_updated_by,
+            is_active,
+            marketing_allowed,
+            created_at,
+            last_bot_activity_at,
+            last_broadcast_at,
+            last_keyboard_sent_at,
+            blocked_at,
+            last_send_error
+
+        FROM users
+
+        ORDER BY created_at
+        """
+    )
+
+    output = io.StringIO()
+
+    writer = csv.writer(
+        output
+    )
+
+    columns = [
+        "telegram_id",
+        "username",
+        "telegram_first_name",
+        "telegram_last_name",
+        "profile_name",
+        "phone",
+        "address",
+        "manual_spend",
+        "bonus_updated_at",
+        "bonus_updated_by",
+        "is_active",
+        "marketing_allowed",
+        "created_at",
+        "last_bot_activity_at",
+        "last_broadcast_at",
+        "last_keyboard_sent_at",
+        "blocked_at",
+        "last_send_error",
+    ]
+
+    writer.writerow(
+        columns
+    )
+
+    for user in users:
+        writer.writerow(
+            [
+                user[column]
+                for column in columns
+            ]
+        )
+
+    filename = (
+        "smoke_factory_users_"
+        + datetime.now(
+            TIMEZONE
+        ).strftime(
+            "%Y%m%d_%H%M"
+        )
+        + ".csv"
+    )
+
+    file = BufferedInputFile(
+        output.getvalue().encode(
+            "utf-8-sig"
+        ),
+        filename=filename,
+    )
+
+    await message.answer_document(
+        file,
+        caption=(
+            f"Пользователей в базе: "
+            f"{len(users)}"
+        ),
+    )
+
+
+# ============================================================================
+# РЕКЛАМНАЯ РАССЫЛКА
+# ============================================================================
+
+@dp.message(
+    Command("broadcast")
+)
+async def cmd_broadcast(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if (
+        broadcast_running
+        or broadcast_lock.locked()
+    ):
+        await message.answer(
+            "⚠️ Другая рассылка уже выполняется."
+        )
+        return
+
+    waiting_broadcast.add(
+        message.from_user.id
+    )
+
+    pending_broadcasts.pop(
+        message.from_user.id,
+        None,
+    )
+
+    await message.answer(
+        (
+            "📣 Пришли следующим сообщением рекламу.\n\n"
+
+            "Можно отправить текст, фотографию, "
+            "видео или документ.\n\n"
+
+            "После этого бот покажет предпросмотр.\n"
+
+            "Отмена: /cancel"
+        )
+    )
+
+
+@dp.callback_query(
+    F.data == "broadcast_confirm"
+)
+async def callback_broadcast_confirm(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Недостаточно прав",
+            show_alert=True,
+        )
+        return
+
+    prepared = pending_broadcasts.get(
+        call.from_user.id
+    )
+
+    if not prepared:
+        await call.answer(
+            (
+                "Рассылка не найдена. "
+                "Создай её заново."
+            ),
+            show_alert=True,
+        )
+        return
+
+    if (
+        broadcast_running
+        or broadcast_lock.locked()
+    ):
+        await call.answer(
+            "Другая рассылка уже выполняется.",
+            show_alert=True,
+        )
+        return
+
+    await call.answer(
+        "Рассылка запущена"
+    )
+
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+    except TelegramBadRequest:
+        pass
+
+    pending_broadcasts.pop(
+        call.from_user.id,
+        None,
+    )
+
+    asyncio.create_task(
+        run_broadcast(
+            "advertising",
+            int(
+                prepared[
+                    "source_chat_id"
+                ]
+            ),
+            int(
+                prepared[
+                    "source_message_id"
+                ]
+            ),
+        )
+    )
+
+
+@dp.callback_query(
+    F.data == "broadcast_cancel"
+)
+async def callback_broadcast_cancel(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        return
+
+    waiting_broadcast.discard(
+        call.from_user.id
+    )
+
+    pending_broadcasts.pop(
+        call.from_user.id,
+        None,
+    )
+
+    await call.answer(
+        "Рассылка отменена"
+    )
+
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+    except TelegramBadRequest:
+        pass
+
+
+@dp.message(
+    Command("broadcast_history")
+)
+async def cmd_broadcast_history(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if not db_pool:
+        return
+
+    rows = await db_pool.fetch(
+        """
+        SELECT
+            id,
+            broadcast_type,
+            total_targets,
+            delivered,
+            blocked,
+            failed,
+            status,
+            created_at,
+            completed_at
+
+        FROM broadcast_logs
+
+        ORDER BY id DESC
+
+        LIMIT 10
+        """
+    )
+
+    if not rows:
+        await message.answer(
+            "История рассылок пока пуста."
+        )
+        return
+
+    lines = [
+        "📊 Последние рассылки",
+        "",
+    ]
+
+    for row in rows:
+        lines.append(
+            (
+                f"№{row['id']} — "
+                f"{row['broadcast_type']}\n"
+
+                f"Статус: "
+                f"{row['status']}\n"
+
+                f"Всего: "
+                f"{row['total_targets']}, "
+
+                f"доставлено: "
+                f"{row['delivered']}, "
+
+                f"недоступны: "
+                f"{row['blocked']}, "
+
+                f"ошибки: "
+                f"{row['failed']}\n"
+
+                f"Дата: "
+                f"{row['created_at']}\n"
+            )
+        )
+
+    await message.answer(
+        "\n".join(
+            lines
+        )[:4096]
+    )
+
+
+# ============================================================================
+# ОБНОВЛЕНИЕ КЛАВИАТУРЫ
+# ============================================================================
+
+@dp.message(
+    Command("update_keyboard")
+)
+async def cmd_update_keyboard(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    if (
+        broadcast_running
+        or broadcast_lock.locked()
+    ):
+        await message.answer(
+            "⚠️ Другая рассылка уже выполняется."
+        )
+        return
+
+    count = await get_broadcast_target_count(
+        "keyboard"
+    )
+
+    await message.answer(
+        (
+            "🔄 Массовое обновление клавиатуры\n\n"
+
+            f"Получателей: {count}\n\n"
+
+            "Клавиатуру получат все активные "
+            "пользователи, включая отключивших рекламу."
+        ),
+        reply_markup=(
+            build_keyboard_update_confirm()
+        ),
+    )
+
+
+@dp.callback_query(
+    F.data == "keyboard_update_confirm"
+)
+async def callback_keyboard_update_confirm(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Недостаточно прав",
+            show_alert=True,
+        )
+        return
+
+    if (
+        broadcast_running
+        or broadcast_lock.locked()
+    ):
+        await call.answer(
+            "Другая рассылка уже выполняется.",
+            show_alert=True,
+        )
+        return
+
+    await call.answer(
+        "Отправка клавиатуры запущена"
+    )
+
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+    except TelegramBadRequest:
+        pass
+
+    asyncio.create_task(
+        run_broadcast(
+            "keyboard"
+        )
+    )
+
+
+@dp.callback_query(
+    F.data == "keyboard_update_cancel"
+)
+async def callback_keyboard_update_cancel(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        return
+
+    await call.answer(
+        "Отменено"
+    )
+
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=None
+        )
+
+    except TelegramBadRequest:
+        pass
+
+
+# ============================================================================
+# РУЧНАЯ ПОВТОРНАЯ ОТПРАВКА ЧЕКА
+# ============================================================================
+
+@dp.callback_query(
+    F.data.startswith(
+        "resend_receipt:"
+    )
+)
+async def cb_resend_receipt(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Недостаточно прав",
+            show_alert=True,
+        )
+        return
+
+    try:
+        order_id = int(
+            call.data.split(
+                ":",
+                1,
+            )[1]
+        )
+    except Exception:
+        await call.answer(
+            "Ошибка номера заказа",
+            show_alert=True,
+        )
+        return
+
+    # Сразу отвечаем Telegram, чтобы кнопка не зависла.
+    await call.answer(
+        "Отправляю чек…"
+    )
+
+    status_message = await call.message.answer(
+        "⏳ Восстанавливаю заказ из базы и отправляю в чековую программу…"
+    )
+
+    try:
+        print_payload = await build_print_payload_from_database(
+            order_id
+        )
+
+        status_code, response_text = (
+            await send_payload_to_receipt_program(
+                print_payload,
+                timeout_seconds=15,
+            )
+        )
+
+        order_number = safe_str(
+            print_payload.get(
+                "order_number"
+            )
+        )
+
+        await status_message.edit_text(
+            (
+                f"✅ Чек заказа {order_number} "
+                "успешно отправлен в чековую программу.\n\n"
+                f"HTTP: {status_code}\n"
+                f"Ответ: {response_text[:300] or 'OK'}"
+            )
+        )
+
+        logger.info(
+            (
+                "MANUAL PRINT SUCCESS: "
+                "order_id=%s order_number=%s response=%s"
+            ),
+            order_id,
+            order_number,
+            response_text[:500],
+        )
+
+    except asyncio.TimeoutError:
+        await status_message.edit_text(
+            (
+                "❌ Чек не отправлен: чековая программа "
+                "не ответила вовремя.\n\n"
+                "Проверьте интернет, ngrok и запущена ли программа, "
+                "затем нажмите «🧾 Отправить чек» ещё раз."
+            )
+        )
+
+        logger.exception(
+            "MANUAL PRINT TIMEOUT: order_id=%s",
+            order_id,
+        )
+
+    except aiohttp.ClientError as exc:
+        await status_message.edit_text(
+            (
+                "❌ Не удалось подключиться к чековой программе.\n\n"
+                f"Ошибка: {exc}\n\n"
+                "Проверьте PRINT_URL, ngrok и интернет, "
+                "затем нажмите кнопку ещё раз."
+            )
+        )
+
+        logger.exception(
+            "MANUAL PRINT NETWORK ERROR: order_id=%s",
+            order_id,
+        )
+
+    except Exception as exc:
+        await status_message.edit_text(
+            (
+                "❌ Чек не отправлен.\n\n"
+                f"Ошибка: {exc}\n\n"
+                "После восстановления связи нажмите "
+                "«🧾 Отправить чек» ещё раз."
+            )
+        )
+
+        logger.exception(
+            "MANUAL PRINT ERROR: order_id=%s",
+            order_id,
+        )
+
+
+# ============================================================================
+# ОТВЕТ МЕНЕДЖЕРА КЛИЕНТУ
+# ============================================================================
+
+@dp.callback_query(
+    F.data.startswith(
+        "write_client:"
+    )
+)
+async def cb_write_client(
+    call: types.CallbackQuery,
+) -> None:
+    if not is_admin(
+        call.from_user.id
+    ):
+        await call.answer(
+            "Недостаточно прав",
+            show_alert=True,
+        )
+        return
+
+    try:
+        client_id = int(
+            call.data.split(
+                ":",
+                1,
+            )[1]
+        )
+
+    except Exception:
+        await call.answer(
+            "Ошибка данных",
+            show_alert=True,
+        )
+        return
+
+    waiting_reply[
+        call.from_user.id
+    ] = {
+        "client_id": client_id
+    }
+
+    await call.message.answer(
+        (
+            "✍️ Напишите текст клиенту.\n"
+            "Отмена: /cancel"
+        )
+    )
+
+    await call.answer(
+        "Жду текст"
+    )
+
+
+@dp.message(
+    Command("cancel")
+)
+async def cmd_cancel(
+    message: types.Message,
+) -> None:
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    admin_id = message.from_user.id
+
+    cancelled = False
+
+    if admin_id in waiting_reply:
+        waiting_reply.pop(
+            admin_id,
+            None,
+        )
+
+        cancelled = True
+
+    if admin_id in waiting_broadcast:
+        waiting_broadcast.discard(
+            admin_id
+        )
+
+        cancelled = True
+
+    if admin_id in pending_broadcasts:
+        pending_broadcasts.pop(
+            admin_id,
+            None,
+        )
+
+        cancelled = True
+
+    if admin_id in waiting_bonus:
+        waiting_bonus.pop(
+            admin_id,
+            None,
+        )
+
+        cancelled = True
+
+    await message.answer(
+        (
+            "✅ Действие отменено."
+            if cancelled
+            else "Нет активного действия."
+        )
+    )
+
+
+# ============================================================================
+# ЗАКАЗЫ ИЗ TELEGRAM WEB APP
+# ============================================================================
+
+@dp.message(
+    F.content_type
+    == ContentType.WEB_APP_DATA
+)
+async def handle_order(
+    message: types.Message,
+) -> None:
+    logger.info(
+        "===== ПОЛУЧЕН ЗАКАЗ ОТ WEB APP ====="
+    )
+
+    raw = message.web_app_data.data
+
+    logger.info(
+        "RAW: %s",
+        raw,
+    )
+
+    try:
+        data = json.loads(
+            raw
+        )
+
+    except Exception:
+        logger.exception(
+            "JSON parse error"
+        )
+
+        await message.answer(
+            "⚠️ Ошибка данных заказа.",
+            reply_markup=start_keyboard(
+                message.from_user
+            ),
+        )
+
+        return
+
+    user = message.from_user
+
+    client_id = user.id
+
+    await upsert_user(
+        user
+    )
+
+    pay_method = safe_str(
+        data.get(
+            "payMethod",
+            "не выбран",
+        ),
+        "не выбран",
+    )
+
+    username = (
+        f"@{user.username}"
+        if user.username
+        else (
+            user.full_name
+            or "Без имени"
+        )
+    )
+
+    phone = safe_str(
+        data.get(
+            "phone",
+            "не указан",
+        ),
+        "не указан",
+    )
+
+    address = safe_str(
+        data.get(
+            "address",
+            "не указан",
+        ),
+        "не указан",
+    )
+
+    delivery = max(
+        0,
+        safe_int(
+            data.get(
+                "delivery",
+                0,
+            ),
+            0,
+        ),
+    )
+
+    requested_bonus = max(
+        0,
+        safe_int(
+            data.get(
+                "bonusRequested",
+                data.get(
+                    "bonus_requested",
+                    data.get("discountAmount", 0),
+                ),
+            ),
+            0,
+        ),
+    )
+
+    discount_percent = 0
+    discount_amount = 0
+
+    items = (
+        data.get(
+            "items"
+        )
+        or {}
+    )
+
+    if not isinstance(
+        items,
+        dict,
+    ):
+        items = {}
+
+    comment = (
+        data.get(
+            "comment"
+        )
+        or data.get(
+            "comments"
+        )
+        or data.get(
+            "comment_text"
+        )
+        or data.get(
+            "note"
+        )
+        or data.get(
+            "notes"
+        )
+        or ""
+    )
+
+    comment = (
+        safe_str(
+            comment,
+            "",
+        )
+        .strip()
+        .lstrip(";")
+    )
+
+    when_str = ""
+
+    try:
+        if data.get(
+            "orderWhen"
+        ) in (
+            "soonest",
+            "asap",
+        ):
+            raw_date = data.get(
+                "orderDate"
+            )
+
+            dt = (
+                datetime.strptime(
+                    str(
+                        raw_date
+                    ),
+                    "%Y-%m-%d",
+                )
+                if raw_date
+                else datetime.now(
+                    TIMEZONE
+                )
+            )
+
+            when_str = (
+                f"{dt.strftime('%d.%m')}, "
+                "ближайшее"
+            )
+
+        elif (
+            data.get(
+                "orderDate"
+            )
+            and data.get(
+                "orderTime"
+            )
+        ):
+            dt = datetime.strptime(
+                str(
+                    data[
+                        "orderDate"
+                    ]
+                ),
+                "%Y-%m-%d",
+            )
+
+            when_str = (
+                f"{dt.strftime('%d.%m')} "
+                f"в {data['orderTime']}"
+            )
+
+    except Exception:
+        logger.exception(
+            "when_str parse error"
+        )
+
+        when_str = ""
+
+    lines: list[str] = []
+
+    order_items: list[
+        dict
+    ] = []
+
+    for raw_name, info in items.items():
+        if not isinstance(info, dict):
+            continue
+
+        name = safe_str(raw_name, "").strip()
+
+        if name not in MENU_PRICE_MAP:
+            logger.warning(
+                "ORDER REJECTED: unknown item=%r user=%s",
+                name,
+                client_id,
+            )
+            await message.answer(
+                (
+                    "⚠️ В заказе обнаружено неизвестное блюдо. "
+                    "Обновите меню и оформите заказ заново."
+                ),
+                reply_markup=start_keyboard(user),
+            )
+            return
+
+        qty = safe_int(info.get("qty", 0), 0)
+
+        if qty < 1 or qty > 50:
+            await message.answer(
+                "⚠️ Некорректное количество блюда.",
+                reply_markup=start_keyboard(user),
+            )
+            return
+
+        authoritative_price = int(MENU_PRICE_MAP[name])
+        client_price = safe_int(
+            info.get("price", authoritative_price),
+            authoritative_price,
+        )
+
+        if client_price != authoritative_price:
+            logger.warning(
+                (
+                    "PRICE TAMPERING BLOCKED: "
+                    "user=%s item=%r client=%s server=%s"
+                ),
+                client_id,
+                name,
+                client_price,
+                authoritative_price,
+            )
+
+        item_sum = qty * authoritative_price
+        lines.append(f"- {name} ×{qty} = {item_sum} ฿")
+
+        order_items.append(
+            {
+                "name": name,
+                "qty": qty,
+                "price": authoritative_price,
+                "img": safe_str(info.get("img"), ""),
+            }
+        )
+
+    items_text = (
+        "\n".join(
+            lines
+        )
+        if lines
+        else "—"
+    )
+
+    items_total = sum(
+        max(
+            0,
+            safe_int(
+                item.get(
+                    "qty"
+                ),
+                0,
+            ),
+        )
+        *
+        max(
+            0,
+            safe_int(
+                item.get(
+                    "price"
+                ),
+                0,
+            ),
+        )
+        for item
+        in order_items
+    )
+
+    max_requested_by_order = int(
+        items_total * MAX_BONUS_REDEEM_PERCENT / 100
+    )
+    requested_bonus = min(requested_bonus, max_requested_by_order)
+
+    total = items_total + delivery
+
+    data["itemsTotal"] = items_total
+    data["items_total"] = items_total
+    data["bonusRequested"] = requested_bonus
+    data["bonus_requested"] = requested_bonus
+    data["discountPercent"] = 0
+    data["discount_percent"] = 0
+    data["discountAmount"] = 0
+    data["discount_amount"] = 0
+    data["discount"] = 0
+    data["total"] = total
+
+    order_request_id = safe_str(
+        data.get("orderRequestId")
+        or data.get("order_request_id")
+        or f"tg-{client_id}-{message.message_id}",
+        f"tg-{client_id}-{message.message_id}",
+    )[:160]
+
+    order_number = ""
+
+    try:
+        (
+            saved_order_id,
+            order_number,
+        ) = await save_order_to_database(
+            user,
+            data,
+            order_items,
+        )
+
+        data[
+            "order_number"
+        ] = order_number
+
+        logger.info(
+            (
+                "Заказ сохранён в БД: "
+                "id=%s order_number=%s"
+            ),
+            saved_order_id,
+            order_number,
+        )
+
+    except Exception:
+        logger.exception(
+            "Не удалось сохранить заказ в БД"
+        )
+
+        await message.answer(
+            (
+                "⚠️ Произошла внутренняя ошибка сохранения заказа. "
+                "Менеджер уже получил уведомление и свяжется с вами. "
+                "Повторно оформлять заказ не нужно."
+            ),
+            reply_markup=start_keyboard(
+                user
+            ),
+        )
+
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    "🚨 ЗАКАЗ НЕ СОХРАНИЛСЯ В БАЗУ, "
+                    "НО ЕГО НУЖНО ОБРАБОТАТЬ ВРУЧНУЮ!\n\n"
+                    f"Telegram ID клиента: {client_id}\n"
+                    f"Имя: {data.get('name') or username}\n"
+                    f"Телефон: {phone}\n"
+                    f"Адрес: {address}\n"
+                    f"Оплата: {pay_method}\n"
+                    f"Доставка: {delivery} ฿\n"
+                    f"Состав заказа:\n{items_text}\n\n"
+                    f"Предварительный итог: {total} ฿\n\n"
+                    "Клиенту сообщено, что повторять заказ не нужно."
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось сообщить менеджеру об ошибке заказа"
+            )
+
+        return
+
+    try:
+        loyalty_result = await settle_loyalty_order(
+            telegram_id=client_id,
+            order_ref=order_request_id,
+            items_total=items_total,
+            delivery=delivery,
+            requested_bonus=requested_bonus,
+        )
+
+        bonus_used = max(0, safe_int(loyalty_result.get("bonusUsed"), 0))
+        cashback_percent = max(
+            0,
+            min(100, safe_int(loyalty_result.get("cashbackPercent"), 0)),
+        )
+        cashback_earned = max(
+            0,
+            safe_int(loyalty_result.get("cashbackEarned"), 0),
+        )
+        bonus_balance_after = max(
+            0,
+            safe_int(loyalty_result.get("balanceAfter"), 0),
+        )
+        total = max(
+            0,
+            safe_int(
+                loyalty_result.get("total"),
+                items_total - bonus_used + delivery,
+            ),
+        )
+
+        discount_percent = 0
+        discount_amount = bonus_used
+
+        data["bonusUsed"] = bonus_used
+        data["bonus_used"] = bonus_used
+        data["cashbackPercent"] = cashback_percent
+        data["cashback_percent"] = cashback_percent
+        data["cashbackEarned"] = cashback_earned
+        data["cashback_earned"] = cashback_earned
+        data["bonusBalanceAfter"] = bonus_balance_after
+        data["discountPercent"] = 0
+        data["discount_percent"] = 0
+        data["discountAmount"] = bonus_used
+        data["discount_amount"] = bonus_used
+        data["discount"] = bonus_used
+        data["total"] = total
+
+        await update_saved_order_loyalty(
+            saved_order_id,
+            bonus_used,
+            cashback_percent,
+            cashback_earned,
+            total,
+            order_request_id,
+        )
+
+    except Exception:
+        logger.exception("LOYALTY SETTLEMENT ERROR")
+        await cancel_saved_order(saved_order_id)
+
+        await message.answer(
+            (
+                "⚠️ Не удалось безопасно рассчитать бонусы. "
+                "Деньги не списаны, заказ отменён. "
+                "Попробуйте оформить заказ ещё раз."
+            ),
+            reply_markup=start_keyboard(user),
+        )
+        return
+
+    # --------------------------------------------------------
+    # СООБЩЕНИЕ КЛИЕНТУ
+    # --------------------------------------------------------
+
+    client_text = (
+        f"📦 Ваш заказ {order_number} принят!\n\n"
+
+        f"Имя: "
+        f"{data.get('name') or username}\n"
+
+        f"Телефон: "
+        f"{phone}\n"
+
+        f"Адрес: "
+        f"{address}\n"
+
+        f"Оплата: "
+        f"{pay_method}\n"
+    )
+
+    if when_str:
+        client_text += (
+            f"Время: "
+            f"{when_str}\n"
+        )
+
+    if comment:
+        client_text += (
+            f"Комментарий: "
+            f"{comment}\n"
+        )
+
+    client_text += (
+        "\n🧾 Состав заказа:\n"
+
+        f"{items_text}\n\n"
+
+        f"Сумма блюд: "
+        f"{items_total} ฿\n"
+    )
+
+    if bonus_used > 0:
+        client_text += (
+            f"Использовано бонусов: -{bonus_used} ฿\n"
+        )
+
+    if cashback_earned > 0:
+        client_text += (
+            f"Начислено кэшбэка {cashback_percent}%: "
+            f"+{cashback_earned} ฿\n"
+            f"Бонусный баланс: {bonus_balance_after} ฿\n"
+        )
+
+    client_text += (
+        f"Доставка: "
+        f"{delivery} ฿\n"
+
+        f"💰 Итого: "
+        f"{total} ฿"
+    )
+
+    await message.answer(
+        client_text,
+        reply_markup=start_keyboard(
+            user
+        ),
+    )
+
+    KEYBOARD_SHOWN_USERS.add(
+        client_id
+    )
+
+    # --------------------------------------------------------
+    # СООБЩЕНИЕ МЕНЕДЖЕРУ
+    # --------------------------------------------------------
+
+    customer_name = safe_str(
+        data.get(
+            "name"
+        )
+        or username
+    )
+
+    admin_text = (
+        f"✅ <b>Новый заказ {order_number}</b>\n"
+
+        f"• <i>Номер:</i> "
+        f"<code>{order_number}</code>\n"
+
+        f"• <i>Пользователь:</i> "
+        f"{html.escape(username)}\n"
+
+        f"• <i>User ID:</i> "
+        f"<code>{client_id}</code>\n"
+
+        f"• <i>Имя:</i> "
+        f"{html.escape(customer_name)}\n"
+
+        f"• <i>Телефон:</i> "
+        f"{html.escape(phone)}\n"
+
+        f"• <i>Адрес:</i> "
+        f"{html.escape(address)}\n"
+
+        f"• <i>Оплата:</i> "
+        f"{html.escape(pay_method)}\n"
+    )
+
+    if when_str:
+        admin_text += (
+            f"• <i>Время заказа:</i> "
+            f"{html.escape(when_str)}\n"
+        )
+
+    if comment:
+        admin_text += (
+            f"• <i>Комментарий:</i> "
+            f"{html.escape(comment)}\n"
+        )
+
+    admin_text += (
+        "\n🍽 <b>Состав заказа:</b>\n"
+
+        f"{html.escape(items_text)}\n\n"
+
+        f"• <i>Сумма блюд:</i> "
+        f"{items_total} ฿\n"
+    )
+
+    if bonus_used > 0:
+        admin_text += (
+            f"• <i>Использовано бонусов:</i> "
+            f"-{bonus_used} ฿\n"
+        )
+
+    if cashback_earned > 0:
+        admin_text += (
+            f"• <i>Начислено кэшбэка:</i> "
+            f"{cashback_percent}% (+{cashback_earned} ฿)\n"
+        )
+
+    admin_text += (
+        f"• <i>Доставка:</i> "
+        f"{delivery} ฿\n"
+
+        f"💰 <b>Итого:</b> "
+        f"{total} ฿"
+    )
+
+    try:
+        await send_order_to_admin(
+            admin_text,
+            client_id,
+            saved_order_id,
+        )
+
+    except Exception:
+        logger.exception(
+            (
+                "ADMIN send failed окончательно, "
+                "даже без profile кнопки"
+            )
+        )
+
+    # --------------------------------------------------------
+    # ДАННЫЕ ДЛЯ ЧЕКОВОЙ ПРОГРАММЫ
+    # --------------------------------------------------------
+
+    print_payload = {
+        # Единственный номер заказа.
+        # Чековая программа должна принять его,
+        # сохранить и напечатать без собственного подсчёта.
+        "order_number":
+            order_number,
+
+        "orderNumber":
+            order_number,
+
+        "order_no":
+            order_number,
+
+        "orderNo":
+            order_number,
+
+        "name": customer_name,
+
+        "phone": phone,
+
+        "address": address,
+
+        "delivery": delivery,
+
+        "payment": pay_method,
+
+        "items": order_items,
+
+        # Сумма блюд до скидки.
+        "items_total":
+            items_total,
+
+        "itemsTotal":
+            items_total,
+
+        "subtotal":
+            items_total,
+
+        # Формат чековой программы.
+        "discount_percent":
+            discount_percent,
+
+        "discount_amount":
+            discount_amount,
+
+        # Дополнительные варианты
+        # для совместимости.
+        "discountPercent":
+            discount_percent,
+
+        "discountAmount":
+            discount_amount,
+
+        "discount":
+            bonus_used,
+
+        "bonus_used":
+            bonus_used,
+
+        "bonusUsed":
+            bonus_used,
+
+        "used_bonuses":
+            bonus_used,
+
+        "cashback_percent":
+            cashback_percent,
+
+        "cashback_earned":
+            cashback_earned,
+
+        "bonus_balance_after":
+            bonus_balance_after,
+
+        # Итог после списания бонусов
+        # и с доставкой.
+        "total": total,
+
+        "date": datetime.now(
+            TIMEZONE
+        ).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+
+        "order_time":
+            when_str,
+
+        "order_when":
+            safe_str(
+                data.get(
+                    "orderWhen"
+                )
+            ),
+
+        "comment":
+            comment,
+
+        "comments":
+            comment,
+
+        "comment_text":
+            comment,
+
+        "note":
+            comment,
+
+        "notes":
+            comment,
+    }
+
+    logger.info(
+        (
+            "PRINT PAYLOAD: "
+            "order_number=%s "
+            "discount_percent=%s "
+            "discount_amount=%s "
+            "items_total=%s "
+            "delivery=%s "
+            "total=%s"
+        ),
+        print_payload[
+            "order_number"
+        ],
+        print_payload[
+            "discount_percent"
+        ],
+        print_payload[
+            "discount_amount"
+        ],
+        print_payload[
+            "items_total"
+        ],
+        print_payload[
+            "delivery"
+        ],
+        print_payload[
+            "total"
+        ],
+    )
+
+    try:
+        (
+            print_status,
+            print_response,
+        ) = await send_payload_to_receipt_program(
+            print_payload,
+            timeout_seconds=7,
+        )
+
+        logger.info(
+            (
+                "Печать отправлена: "
+                "HTTP %s, ответ: %s"
+            ),
+            print_status,
+            print_response[:500],
+        )
+
+    except Exception as exc:
+        logger.exception(
+            (
+                "PRINT DELIVERY FAILED (NON-FATAL). "
+                "Заказ уже сохранён в базе и отправлен менеджеру. "
+                "Чек можно дослать кнопкой «🧾 Отправить чек»."
+            )
+        )
+
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    f"⚠️ Заказ {order_number} принят, "
+                    "но чековая программа сейчас недоступна.\n\n"
+                    "Заказ НЕ потерян. Нажмите кнопку "
+                    "«🧾 Отправить чек» под заказом после "
+                    "восстановления связи.\n\n"
+                    f"Ошибка: {safe_str(exc)[:500]}"
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось отправить менеджеру предупреждение о печати"
+            )
+
+
+# ============================================================================
+# СООБЩЕНИЯ АДМИНИСТРАТОРА
+# ============================================================================
+
+@dp.message(
+    F.from_user.id
+    == ADMIN_CHAT_ID
+)
+async def admin_message_router(
+    message: types.Message,
+) -> None:
+    admin_id = message.from_user.id
+
+    if (
+        message.text
+        and message.text.startswith(
+            "/"
+        )
+    ):
+        return
+
+    # --------------------------------------------------------
+    # /bonus
+    # --------------------------------------------------------
+
+    if admin_id in waiting_bonus:
+        state = waiting_bonus[
+            admin_id
+        ]
+
+        if not message.text:
+            await message.answer(
+                "Отправь ID и сумму обычным текстом."
+            )
+            return
+
+        text = message.text.strip()
+
+        parts = text.split()
+
+        if (
+            state.get(
+                "stage"
+            ) == "telegram_id"
+            and len(parts) >= 2
+        ):
+            try:
+                telegram_id = int(
+                    parts[0]
+                )
+
+            except ValueError:
+                await message.answer(
+                    "Telegram ID должен состоять из цифр."
+                )
+                return
+
+            amount = parse_money_amount(
+                "".join(
+                    parts[1:]
+                )
+            )
+
+            if amount is None:
+                await message.answer(
+                    (
+                        "Сумма указана неправильно.\n"
+                        "Пример: 123456789 5000"
+                    )
+                )
+                return
+
+            await process_bonus_amount(
+                message,
+                telegram_id,
+                amount,
+            )
+
+            return
+
+        if (
+            state.get(
+                "stage"
+            ) == "telegram_id"
+        ):
+            try:
+                telegram_id = int(
+                    text
+                )
+
+            except ValueError:
+                await message.answer(
+                    (
+                        "Telegram ID должен состоять из цифр.\n"
+                        "Пример: 123456789"
+                    )
+                )
+                return
+
+            state[
+                "telegram_id"
+            ] = telegram_id
+
+            state[
+                "stage"
+            ] = "amount"
+
+            known_user = None
+
+            if db_pool:
+                known_user = await db_pool.fetchrow(
+                    """
+                    SELECT
+                        telegram_first_name,
+                        telegram_last_name,
+                        username,
+                        manual_spend
+
+                    FROM users
+
+                    WHERE telegram_id = $1
+                    """,
+                    telegram_id,
+                )
+
+            if known_user:
+                full_name = " ".join(
+                    part
+                    for part in (
+                        known_user[
+                            "telegram_first_name"
+                        ],
+                        known_user[
+                            "telegram_last_name"
+                        ],
+                    )
+                    if part
+                ).strip()
+
+                username = (
+                    f"@{known_user['username']}"
+                    if known_user[
+                        "username"
+                    ]
+                    else "без username"
+                )
+
+                current_manual = int(
+                    known_user[
+                        "manual_spend"
+                    ]
+                    or 0
+                )
+
+                await message.answer(
+                    (
+                        "✅ Пользователь найден\n\n"
+
+                        f"ID: {telegram_id}\n"
+
+                        f"Имя: "
+                        f"{full_name or '-'}\n"
+
+                        f"Username: "
+                        f"{username}\n"
+
+                        f"Текущая ручная сумма: "
+                        f"{current_manual:,} ฿\n\n"
+
+                        "Теперь отправь новую сумму.\n"
+
+                        "Пример: 5000"
+                    ).replace(
+                        ",",
+                        " ",
+                    )
+                )
+
+            else:
+                await message.answer(
+                    (
+                        f"ID принят: {telegram_id}\n\n"
+
+                        "Пользователь в базе бота пока "
+                        "не найден, но сумма будет записана "
+                        "в его личный кабинет.\n\n"
+
+                        "Теперь отправь сумму.\n"
+
+                        "Пример: 5000"
+                    )
+                )
+
+            return
+
+        if (
+            state.get(
+                "stage"
+            ) == "amount"
+        ):
+            amount = parse_money_amount(
+                text
+            )
+
+            if amount is None:
+                await message.answer(
+                    (
+                        "Сумма указана неправильно.\n"
+
+                        "Отправь целое число от 0 "
+                        "до 10 000 000.\n"
+
+                        "Пример: 5000"
+                    )
+                )
+                return
+
+            telegram_id = int(
+                state[
+                    "telegram_id"
+                ]
+            )
+
+            await process_bonus_amount(
+                message,
+                telegram_id,
+                amount,
+            )
+
+            return
+
+    # --------------------------------------------------------
+    # Ответ клиенту
+    # --------------------------------------------------------
+
+    if admin_id in waiting_reply:
+        if not message.text:
+            await message.answer(
+                "Для ответа клиенту отправь текст."
+            )
+            return
+
+        client_id = waiting_reply.pop(
+            admin_id
+        )[
+            "client_id"
+        ]
+
+        try:
+            await bot.send_message(
+                client_id,
+                (
+                    "💬 Сообщение от менеджера:\n\n"
+                    f"{message.text}"
+                ),
+            )
+
+            await message.answer(
+                "✅ Отправлено клиенту."
+            )
+
+            await mark_send_success(
+                client_id,
+                "direct",
+            )
+
+        except Exception as exc:
+            blocked = is_blocking_error(
+                exc
+            )
+
+            await mark_send_error(
+                client_id,
+                str(exc),
+                blocked,
+            )
+
+            logger.exception(
+                "Не удалось отправить клиенту %s",
+                client_id,
+            )
+
+            await message.answer(
+                (
+                    "⚠️ Не получилось отправить. "
+                    "Клиент мог заблокировать бота."
+                )
+            )
+
+        return
+
+    # --------------------------------------------------------
+    # Рекламная рассылка
+    # --------------------------------------------------------
+
+    if admin_id in waiting_broadcast:
+        waiting_broadcast.discard(
+            admin_id
+        )
+
+        pending_broadcasts[
+            admin_id
+        ] = {
+            "source_chat_id":
+                message.chat.id,
+
+            "source_message_id":
+                message.message_id,
+        }
+
+        target_count = (
+            await get_broadcast_target_count(
+                "advertising"
+            )
+        )
+
+        try:
+            await bot.copy_message(
+                chat_id=ADMIN_CHAT_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+                reply_markup=(
+                    build_broadcast_confirm_keyboard()
+                ),
+            )
+
+            await message.answer(
+                (
+                    "👆 Предпросмотр рекламного сообщения.\n\n"
+
+                    f"Получателей: {target_count}\n\n"
+
+                    "Проверь сообщение и нажми кнопку "
+                    "под предпросмотром."
+                )
+            )
+
+        except Exception as exc:
+            pending_broadcasts.pop(
+                admin_id,
+                None,
+            )
+
+            logger.exception(
+                "Не удалось создать предпросмотр рассылки"
+            )
+
+            await message.answer(
+                (
+                    "⚠️ Не удалось подготовить сообщение.\n"
+                    f"Ошибка: {exc}"
+                )
+            )
+
+        return
+
+
+# ============================================================================
+# ОБЫЧНЫЕ СООБЩЕНИЯ
+# ============================================================================
+
+@dp.message()
+async def ensure_keyboard_if_missing(
+    message: types.Message,
+) -> None:
+    if (
+        message.content_type
+        == ContentType.WEB_APP_DATA
+    ):
+        return
+
+    if message.text in (
+        ASK_BTN_TEXT,
+        MENU_BTN_TEXT,
+    ):
+        return
+
+    await send_main_keyboard(
+        message,
+        "Выберите действие 👇",
+        force=False,
+    )
+
+
+# ============================================================================
+# ЗАПУСК
+# ============================================================================
+
+async def main() -> None:
+    logger.info(
+        "=== Запуск бота Smoke Factory BBQ ==="
+    )
+
+    logger.info(
+        "WEBAPP_URL=%s",
+        WEBAPP_URL,
+    )
+
+    try:
+        await bot.delete_webhook(
+            drop_pending_updates=True
+        )
+
+    except Exception as exc:
+        logger.error(
+            "delete_webhook error: %s",
+            exc,
+        )
+
+    await init_database()
+
+    run_fake_server(
+        PORT
+    )
+
+    schedule_restart()
+
+    logger.info(
+        "Бот запущен и готов сохранять пользователей"
+    )
+
+    try:
+        await dp.start_polling(
+            bot
+        )
+
+    finally:
+        if db_pool:
+            await db_pool.close()
+
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(
+        main()
+    )
