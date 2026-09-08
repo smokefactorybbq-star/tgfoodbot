@@ -127,15 +127,14 @@ RATE_BTN_TEXT = "Курс"
 
 LOYALTY_SETTLE_URL = f"{WEBAPP_URL}/api/loyalty/settle"
 
-PRINT_URL = os.getenv(
-    "PRINT_URL",
-    "https://pseudosocially-tiddly-alysia.ngrok-free.dev/order",
-)
+# Текущий статический ngrok-домен чековой программы.
+# Не берём старые значения PRINT_URL / GRAB_RECEIVER_URL из Railway Variables,
+# чтобы устаревшая переменная не отправляла заказы на старый туннель.
+NGROK_PRINTER_BASE_URL = "https://pseudosocially-tiddly-alysia.ngrok-free.dev"
+PRINT_URL = NGROK_PRINTER_BASE_URL + "/order"
 
-# Старый рабочий канал стикеров чековой программы.
-# Если отдельный GRAB_RECEIVER_URL не задан, используем тот же хост, что PRINT_URL,
-# и старый маршрут /grab. Никаких изменений printer_gui.py для этого не требуется.
-GRAB_RECEIVER_URL = os.getenv("GRAB_RECEIVER_URL", "").strip()
+# Старый рабочий маршрут стикеров чековой программы.
+GRAB_RECEIVER_URL = NGROK_PRINTER_BASE_URL
 
 WEBSITE_ORDER_SECRET = os.getenv("WEBSITE_ORDER_SECRET", "").strip()
 MEALPOINT_BOT_SECRET = os.getenv("MEALPOINT_BOT_SECRET", "").strip()
@@ -175,6 +174,12 @@ waiting_broadcast: set[int] = set()
 
 # Менеджер вводит курс рублей за 1 бат.
 waiting_rate: set[int] = set()
+
+# Ожидаем от менеджера ручное время поездки для заказов с доставкой.
+# Ключ — message_id вопроса бота менеджеру. Это позволяет корректно
+# обрабатывать несколько заказов подряд через Telegram ForceReply.
+pending_delivery_prompts: dict[int, dict] = {}
+pending_delivery_by_order: dict[str, int] = {}
 
 
 # Подготовленное сообщение для рассылки.
@@ -255,10 +260,13 @@ MENU_PRICE_MAP: dict[str, int] = {
 MAX_BONUS_REDEEM_PERCENT = 20
 
 # Время приготовления — согласованные правила Smoke Factory BBQ.
-# Берём самое долгое блюдо в заказе и затем добавляем 10 минут запаса.
+# Берём самое долгое блюдо в заказе и затем добавляем 5 минут запаса.
 DEFAULT_PREP_MINUTES = 13
-PREP_BUFFER_MINUTES = 10
-DELIVERY_BUFFER_MINUTES = 10
+PREP_BUFFER_MINUTES = 5
+
+# Пока время поездки вводит менеджер вручную.
+# Никаких дополнительных +10 минут к введённому менеджером времени доставки нет.
+DELIVERY_BUFFER_MINUTES = 0
 
 def dish_prep_minutes(name: str) -> int:
     n = safe_str(name, "").lower().replace("ё", "е")
@@ -1192,25 +1200,24 @@ async def send_order_to_screens(order_number: str, prep_minutes: int, items: lis
 
 
 async def calculate_and_store_eta(order_number: str, data: dict, items: list[dict]) -> dict:
+    """
+    Пока автоматическое определение времени поездки отключено.
+    Для DELIVERY бот считает только готовку и затем спрашивает у менеджера
+    фактическое время поездки. Введённые менеджером минуты прибавляются к готовке
+    БЕЗ дополнительного буфера на доставку.
+    """
     prep = preparation_minutes(items)
     fulfillment = order_fulfillment(data)
+    point = extract_destination_coordinates(data)
+
     route = 0
     route_found = fulfillment == "PICKUP"
-    point = extract_destination_coordinates(data)
-    if fulfillment == "DELIVERY":
-        # A map point improves precision, but it is not mandatory. If the client only
-        # typed an address, geocode that address and still calculate the TWO_WHEELER route.
-        if point is None:
-            point = await geocode_delivery_address(
-                safe_str(data.get("address_plain") or data.get("address"), "")
-            )
-        if point:
-            route_raw = await google_two_wheeler_minutes(*point)
-            if route_raw is not None:
-                route = route_raw + DELIVERY_BUFFER_MINUTES
-                route_found = True
-    total = prep + route
+    pending_delivery = fulfillment == "DELIVERY"
+    total = prep
+
+    # На кухонный/курьерский экран отправляем именно время готовки.
     await send_order_to_screens(order_number, prep, items, data.get("cutlery"))
+
     if db_pool:
         await db_pool.execute(
             """
@@ -1219,26 +1226,220 @@ async def calculate_and_store_eta(order_number: str, data: dict, items: list[dic
               prep_minutes=$6, route_minutes=$7, estimated_minutes=$8
             WHERE order_number=$1
             """,
-            order_number, fulfillment,
-            point[0] if point else None, point[1] if point else None,
+            order_number,
+            fulfillment,
+            point[0] if point else None,
+            point[1] if point else None,
             data.get("cutlery") if isinstance(data.get("cutlery"), bool) else None,
-            prep, route, total,
+            prep,
+            0 if fulfillment == "PICKUP" else None,
+            total,
         )
-    return {"prep": prep, "route": route, "total": total, "fulfillment": fulfillment, "route_found": route_found}
+
+    return {
+        "prep": prep,
+        "route": route,
+        "total": total,
+        "fulfillment": fulfillment,
+        "route_found": route_found,
+        "pending_delivery": pending_delivery,
+    }
 
 
 def eta_customer_line(info: dict) -> str:
     if info.get("fulfillment") == "PICKUP":
         return f"Расчётное время приготовления: {safe_int(info.get('prep'), 0)} мин."
+
+    if info.get("pending_delivery"):
+        return "Время доставки уточняем у менеджера. Я сообщу его отдельным сообщением."
+
     if info.get("route_found"):
         return (
             f"Расчётное время доставки: {safe_int(info.get('total'), 0)} мин. "
             "Но мы постараемся как можно быстрее. Как курьер будет выезжать, я вам сообщу."
         )
-    return (
-        f"Расчётное время приготовления: {safe_int(info.get('prep'), 0)} мин. "
-        "Время поездки сейчас не удалось получить; менеджер уточнит доставку."
+
+    return "Время доставки уточняется у менеджера."
+
+
+async def ask_manager_delivery_minutes(
+    order_number: str,
+    telegram_id: int,
+    prep_minutes: int,
+) -> None:
+    """Просит менеджера вручную указать минуты поездки для DELIVERY."""
+    number = safe_str(order_number, "").strip().upper()
+    if not number or not telegram_id:
+        return
+
+    # Не создаём второй вопрос для того же заказа, пока первый ещё ожидает ответ.
+    existing_prompt_id = pending_delivery_by_order.get(number)
+    if existing_prompt_id and existing_prompt_id in pending_delivery_prompts:
+        return
+
+    # Если время уже было сохранено ранее, повторно менеджера не спрашиваем.
+    if db_pool:
+        existing = await db_pool.fetchrow(
+            """
+            SELECT route_minutes, prep_minutes
+            FROM orders
+            WHERE upper(order_number)=$1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            number,
+        )
+        if existing and safe_int(existing["route_minutes"], 0) > 0:
+            return
+        if existing and safe_int(existing["prep_minutes"], 0) > 0:
+            prep_minutes = safe_int(existing["prep_minutes"], prep_minutes)
+
+    prompt = await bot.send_message(
+        ADMIN_CHAT_ID,
+        (
+            f"🚚 Заказ {number}\n"
+            "Сколько времени на доставку?\n"
+            "Ответьте числом, например 20."
+        ),
+        reply_markup=types.ForceReply(
+            selective=True,
+            input_field_placeholder="20",
+        ),
     )
+
+    pending_delivery_prompts[prompt.message_id] = {
+        "order_number": number,
+        "telegram_id": int(telegram_id),
+        "prep_minutes": max(1, safe_int(prep_minutes, 1)),
+    }
+    pending_delivery_by_order[number] = prompt.message_id
+
+
+async def handle_manager_delivery_minutes_reply(
+    message: types.Message,
+) -> bool:
+    """Обрабатывает ответ менеджера на вопрос «Сколько времени на доставку?»."""
+    if not message.text:
+        return False
+
+    info = None
+    prompt_id = None
+
+    reply = message.reply_to_message
+    if reply:
+        prompt_id = int(reply.message_id)
+        info = pending_delivery_prompts.get(prompt_id)
+
+        # После рестарта бота память могла очиститься. Восстанавливаем заказ
+        # по номеру из текста исходного ForceReply-сообщения.
+        if info is None:
+            reply_text = safe_str(reply.text, "")
+            match = re.search(r"\b(SM-[0-9]+)\b", reply_text, flags=re.I)
+            if match and db_pool:
+                number = match.group(1).upper()
+                row = await db_pool.fetchrow(
+                    """
+                    SELECT telegram_id, prep_minutes
+                    FROM orders
+                    WHERE upper(order_number)=$1
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    number,
+                )
+                if row:
+                    info = {
+                        "order_number": number,
+                        "telegram_id": int(row["telegram_id"]),
+                        "prep_minutes": max(1, safe_int(row["prep_minutes"], 1)),
+                    }
+
+    # ForceReply обычно даёт reply_to_message. Если Telegram-клиент прислал
+    # просто число и ожидается ровно один заказ — тоже принимаем его.
+    if info is None and admin_id_not_waiting_rate(message.from_user.id):
+        live = [
+            (pid, value)
+            for pid, value in pending_delivery_prompts.items()
+            if value
+        ]
+        if len(live) == 1:
+            prompt_id, info = live[0]
+
+    if info is None:
+        return False
+
+    match = re.fullmatch(
+        r"\s*([0-9]{1,3})\s*(?:мин(?:\.|ут(?:а|ы)?)?)?\s*",
+        message.text,
+        flags=re.I,
+    )
+    if not match:
+        await message.answer(
+            "Введите только время доставки в минутах. Например: 20"
+        )
+        return True
+
+    delivery_minutes = int(match.group(1))
+    if delivery_minutes < 1 or delivery_minutes > 240:
+        await message.answer(
+            "Введите время доставки от 1 до 240 минут."
+        )
+        return True
+
+    number = safe_str(info.get("order_number"), "").strip().upper()
+    telegram_id = safe_int(info.get("telegram_id"), 0)
+    prep_minutes = max(1, safe_int(info.get("prep_minutes"), 1))
+
+    # Важно: никаких +10 минут к доставке здесь нет.
+    total_minutes = prep_minutes + delivery_minutes
+
+    if db_pool:
+        await db_pool.execute(
+            """
+            UPDATE orders
+            SET route_minutes=$2,
+                estimated_minutes=$3
+            WHERE upper(order_number)=$1
+            """,
+            number,
+            delivery_minutes,
+            total_minutes,
+        )
+
+    if telegram_id:
+        try:
+            await bot.send_message(
+                telegram_id,
+                (
+                    f"🚚 Заказ {number}\n"
+                    f"Расчётное время доставки: {total_minutes} мин.\n"
+                    f"Готовка: {prep_minutes} мин. + доставка: {delivery_minutes} мин.\n\n"
+                    "Но мы постараемся как можно быстрее. "
+                    "Как курьер будет выезжать, я вам сообщу."
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось отправить клиенту ручной ETA: %s",
+                number,
+            )
+
+    if prompt_id is not None:
+        pending_delivery_prompts.pop(prompt_id, None)
+    pending_delivery_by_order.pop(number, None)
+
+    await message.answer(
+        (
+            f"✅ Заказ {number}: время доставки сохранено.\n"
+            f"Готовка {prep_minutes} + доставка {delivery_minutes} = "
+            f"{total_minutes} мин."
+        )
+    )
+    return True
+
+
+def admin_id_not_waiting_rate(admin_id: int) -> bool:
+    return admin_id not in waiting_rate
 
 
 async def latest_pending_promptpay_order(telegram_id: int):
@@ -5710,6 +5911,21 @@ async def handle_order(
             )
         )
 
+    # Пока автоматический маршрут не настроен, для DELIVERY отдельно
+    # спрашиваем менеджера о времени поездки.
+    if eta_info.get("pending_delivery"):
+        try:
+            await ask_manager_delivery_minutes(
+                order_number,
+                client_id,
+                safe_int(eta_info.get("prep"), 1),
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось запросить у менеджера время доставки: %s",
+                order_number,
+            )
+
     # --------------------------------------------------------
     # ДАННЫЕ ДЛЯ ЧЕКОВОЙ ПРОГРАММЫ
     # --------------------------------------------------------
@@ -6017,6 +6233,12 @@ async def admin_message_router(
             "/"
         )
     ):
+        return
+
+    # --------------------------------------------------------
+    # Ручное время доставки — ответ на ForceReply от бота
+    # --------------------------------------------------------
+    if await handle_manager_delivery_minutes_reply(message):
         return
 
     # --------------------------------------------------------
@@ -6565,11 +6787,27 @@ async def http_website_order(request: web.Request) -> web.Response:
     admin_text=(f"✅ <b>Новый заказ {html.escape(order_number)}</b>\n"
                 f"• Клиент: {html.escape(customer_name)}\n• Телефон: {html.escape(phone)}\n"
                 f"• Адрес: {html.escape(address)}\n• Оплата: {html.escape(payment)}\n"
-                f"• ETA: {safe_int(eta.get('total'),0)} мин\n\n🍽 <b>Состав:</b>\n{html.escape(item_lines)}\n\n💰 <b>Итого:</b> {total} ฿")
+                f"• Готовка: {safe_int(eta.get('prep'),0)} мин\n"
+                + ("• Доставка: ожидает ответа менеджера\n" if eta.get("pending_delivery") else "") +
+                f"\n🍽 <b>Состав:</b>\n{html.escape(item_lines)}\n\n💰 <b>Итого:</b> {total} ฿")
     try:
         await send_order_to_admin(admin_text, telegram_id, int(row["id"]))
     except Exception:
         logger.exception("Website order manager notify failed")
+
+    if eta.get("pending_delivery"):
+        try:
+            await ask_manager_delivery_minutes(
+                order_number,
+                telegram_id,
+                safe_int(eta.get("prep"), 1),
+            )
+        except Exception:
+            logger.exception(
+                "Website order delivery-time prompt failed: %s",
+                order_number,
+            )
+
     print_payload={
         "order_number":order_number,"orderNumber":order_number,"order_no":order_number,"orderNo":order_number,
         "name":customer_name,"phone":phone,"address":address,"delivery":max(0,safe_int(data.get("delivery"),0)),
@@ -6665,6 +6903,9 @@ async def main() -> None:
         "WEBAPP_URL=%s",
         WEBAPP_URL,
     )
+
+    logger.info("PRINT_URL=%s", PRINT_URL)
+    logger.info("GRAB_URL=%s", grab_label_url())
 
     try:
         await bot.delete_webhook(
