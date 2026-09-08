@@ -1206,22 +1206,41 @@ async def calculate_and_store_eta(order_number: str, data: dict, items: list[dic
                 route = route_raw + DELIVERY_BUFFER_MINUTES
                 route_found = True
     total = prep + route
-    await send_order_to_screens(order_number, prep, items, data.get("cutlery"))
+
+    # ВАЖНО: экран является частью автоматической обработки заказа.
+    # Раньше ошибка здесь молча игнорировалась и заказ выглядел успешно принятым,
+    # хотя кухня/курьер ничего не получали. Теперь результат сохраняется в ETA.
+    screen_ok = await send_order_to_screens(
+        order_number, prep, items, data.get("cutlery")
+    )
+
     if db_pool:
         point = extract_destination_coordinates(data)
-        await db_pool.execute(
-            """
-            UPDATE orders SET fulfillment_type=$2, customer_latitude=COALESCE($3,customer_latitude),
-              customer_longitude=COALESCE($4,customer_longitude), cutlery=COALESCE($5,cutlery),
-              prep_minutes=$6, route_minutes=$7, estimated_minutes=$8
-            WHERE order_number=$1
-            """,
-            order_number, fulfillment,
-            point[0] if point else None, point[1] if point else None,
-            data.get("cutlery") if isinstance(data.get("cutlery"), bool) else None,
-            prep, route, total,
-        )
-    return {"prep": prep, "route": route, "total": total, "fulfillment": fulfillment, "route_found": route_found}
+        try:
+            await db_pool.execute(
+                """
+                UPDATE orders SET fulfillment_type=$2, customer_latitude=COALESCE($3,customer_latitude),
+                  customer_longitude=COALESCE($4,customer_longitude), cutlery=COALESCE($5,cutlery),
+                  prep_minutes=$6, route_minutes=$7, estimated_minutes=$8
+                WHERE order_number=$1
+                """,
+                order_number, fulfillment,
+                point[0] if point else None, point[1] if point else None,
+                data.get("cutlery") if isinstance(data.get("cutlery"), bool) else None,
+                prep, route, total,
+            )
+        except Exception:
+            # Разные БД сайта и бота не должны блокировать отправку заказа на ТВ.
+            logger.exception("Не удалось сохранить ETA в БД для %s", order_number)
+
+    return {
+        "prep": prep,
+        "route": route,
+        "total": total,
+        "fulfillment": fulfillment,
+        "route_found": route_found,
+        "screen_ok": screen_ok,
+    }
 
 
 def eta_customer_line(info: dict) -> str:
@@ -6263,61 +6282,152 @@ def _secret_ok(request: web.Request, header: str, expected: str) -> bool:
 
 
 async def http_health(_request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "tgfoodbot"})
+    return web.json_response({
+        "ok": True,
+        "service": "tgfoodbot",
+        "database": bool(db_pool),
+        "screen_configured": bool(SCREEN_SERVICE_URL and SCREEN_SERVICE_SECRET),
+        "screen_service_url": SCREEN_SERVICE_URL or None,
+        "google_maps_configured": bool(GOOGLE_MAPS_API_KEY),
+    })
 
 
 async def http_website_order(request: web.Request) -> web.Response:
     if not _secret_ok(request, "X-Website-Order-Secret", WEBSITE_ORDER_SECRET):
         return web.json_response({"ok": False, "error": "UNAUTHORIZED"}, status=401)
+
     data = await _json_request(request)
-    order_number = safe_str(data.get("order_number") or data.get("orderNumber"), "").strip().upper()
+    order_number = safe_str(
+        data.get("order_number") or data.get("orderNumber"), ""
+    ).strip().upper()
     telegram_id = safe_int(data.get("telegram_id"), 0)
-    if not order_number or not telegram_id or not db_pool:
+
+    if not order_number or not telegram_id:
         return web.json_response({"ok": False, "error": "INVALID_ORDER"}, status=400)
-    row = await db_pool.fetchrow("SELECT id,total FROM orders WHERE order_number=$1 AND telegram_id=$2 LIMIT 1", order_number, telegram_id)
-    if not row:
-        return web.json_response({"ok": False, "error": "ORDER_NOT_FOUND"}, status=404)
+
+    # Сайт уже передаёт полный заказ. Не блокируем кухню из-за того, что
+    # сайт и tgfoodbot временно подключены к разным PostgreSQL.
+    row = None
+    if db_pool:
+        try:
+            row = await db_pool.fetchrow(
+                "SELECT id,total FROM orders WHERE order_number=$1 AND telegram_id=$2 LIMIT 1",
+                order_number, telegram_id
+            )
+        except Exception:
+            logger.exception("Website order DB lookup failed: %s", order_number)
+
     items_raw = data.get("items") or []
-    items = []
+    items: list[dict] = []
     if isinstance(items_raw, list):
         for x in items_raw:
-            if isinstance(x, dict):
-                items.append({"name": safe_str(x.get("name")), "qty": max(1,safe_int(x.get("qty"),1)), "price": max(0,safe_int(x.get("price"),0)), "img": safe_str(x.get("img"))})
+            if not isinstance(x, dict):
+                continue
+            name = safe_str(x.get("name"), "").strip()
+            if not name:
+                continue
+            items.append({
+                "name": name,
+                "qty": max(1, safe_int(x.get("qty"), 1)),
+                "price": max(0, safe_int(x.get("price"), 0)),
+                "img": safe_str(x.get("img")),
+            })
+
+    if not items:
+        return web.json_response({"ok": False, "error": "ITEMS_REQUIRED"}, status=400)
+
     eta = await calculate_and_store_eta(order_number, data, items)
+
+    if not eta.get("screen_ok"):
+        logger.error(
+            "ORDER %s NOT SENT TO SCREEN. SCREEN_SERVICE_URL=%r configured_secret=%s",
+            order_number, SCREEN_SERVICE_URL, bool(SCREEN_SERVICE_SECRET)
+        )
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                (
+                    f"⚠️ Заказ {order_number} принят, но НЕ появился на экранах.\n"
+                    "Проверьте SCREEN_SERVICE_URL и SCREEN_SERVICE_SECRET в Railway tgfoodbot, "
+                    "а также SCREEN_SERVICE_SECRET в сервисе экранов."
+                ),
+            )
+        except Exception:
+            logger.exception("Не удалось уведомить менеджера об ошибке экрана")
+
     try:
-        await bot.send_message(telegram_id, f"📦 Ваш заказ {order_number} принят и уже готовится!\n{eta_customer_line(eta)}")
+        await bot.send_message(
+            telegram_id,
+            f"📦 Ваш заказ {order_number} принят и уже готовится!\n{eta_customer_line(eta)}"
+        )
     except Exception:
         logger.exception("Website order customer notify failed")
-    customer_name=safe_str(data.get("name"), "")
-    phone=safe_str(data.get("phone"), "")
-    address=safe_str(data.get("address"), "")
-    payment=normalized_payment(data.get("payment") or data.get("payMethod"))
-    total=max(0,safe_int(data.get("total"),safe_int(row["total"],0)))
-    item_lines="\n".join(f"• {safe_str(x.get('name'))} ×{safe_int(x.get('qty'),1)}" for x in items) or "—"
-    admin_text=(f"✅ <b>Новый заказ {html.escape(order_number)}</b>\n"
-                f"• Клиент: {html.escape(customer_name)}\n• Телефон: {html.escape(phone)}\n"
-                f"• Адрес: {html.escape(address)}\n• Оплата: {html.escape(payment)}\n"
-                f"• ETA: {safe_int(eta.get('total'),0)} мин\n\n🍽 <b>Состав:</b>\n{html.escape(item_lines)}\n\n💰 <b>Итого:</b> {total} ฿")
+
+    customer_name = safe_str(data.get("name"), "")
+    phone = safe_str(data.get("phone"), "")
+    address = safe_str(data.get("address"), "")
+    payment = normalized_payment(data.get("payment") or data.get("payMethod"))
+    fallback_total = max(0, safe_int(data.get("total"), 0))
+    total = fallback_total
+    if row is not None:
+        total = max(0, safe_int(data.get("total"), safe_int(row["total"], fallback_total)))
+
+    item_lines = "\n".join(
+        f"• {safe_str(x.get('name'))} ×{safe_int(x.get('qty'),1)}" for x in items
+    ) or "—"
+    admin_text = (
+        f"✅ <b>Новый заказ {html.escape(order_number)}</b>\n"
+        f"• Клиент: {html.escape(customer_name)}\n"
+        f"• Телефон: {html.escape(phone)}\n"
+        f"• Адрес: {html.escape(address)}\n"
+        f"• Оплата: {html.escape(payment)}\n"
+        f"• ETA: {safe_int(eta.get('total'),0)} мин\n"
+        f"• Экран: {'✅ отправлен' if eta.get('screen_ok') else '❌ ошибка'}\n\n"
+        f"🍽 <b>Состав:</b>\n{html.escape(item_lines)}\n\n"
+        f"💰 <b>Итого:</b> {total} ฿"
+    )
+
     try:
-        await send_order_to_admin(admin_text, telegram_id, int(row["id"]))
+        if row is not None:
+            await send_order_to_admin(admin_text, telegram_id, int(row["id"]))
+        else:
+            # Если БД сайта и бота разные, заказ всё равно должен попасть менеджеру.
+            await bot.send_message(ADMIN_CHAT_ID, admin_text, parse_mode="HTML")
     except Exception:
         logger.exception("Website order manager notify failed")
-    print_payload={
-        "order_number":order_number,"orderNumber":order_number,"order_no":order_number,"orderNo":order_number,
-        "name":customer_name,"phone":phone,"address":address,"delivery":max(0,safe_int(data.get("delivery"),0)),
-        "payment":payment,"items":items,"items_total":max(0,safe_int(data.get("items_total"),0)),
-        "discount_amount":max(0,safe_int(data.get("bonus_used"),0)),"discount_percent":0,"total":total,
-        "order_time":safe_str(data.get("order_time")),"order_when":safe_str(data.get("order_when")),"comment":safe_str(data.get("comment")),
+
+    print_payload = {
+        "order_number": order_number, "orderNumber": order_number,
+        "order_no": order_number, "orderNo": order_number,
+        "name": customer_name, "phone": phone, "address": address,
+        "delivery": max(0, safe_int(data.get("delivery"), 0)),
+        "payment": payment, "items": items,
+        "items_total": max(0, safe_int(data.get("items_total"), 0)),
+        "discount_amount": max(0, safe_int(data.get("bonus_used"), 0)),
+        "discount_percent": 0, "total": total,
+        "order_time": safe_str(data.get("order_time")),
+        "order_when": safe_str(data.get("order_when")),
+        "comment": safe_str(data.get("comment")),
     }
     try:
         await send_payload_to_receipt_program(print_payload, timeout_seconds=7)
     except Exception:
         logger.exception("Website order print failed")
         try:
-            await bot.send_message(ADMIN_CHAT_ID, f"⚠️ {order_number}: заказ принят, но чековая программа недоступна.")
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                f"⚠️ {order_number}: заказ принят, но чековая программа недоступна."
+            )
         except Exception:
             pass
-    return web.json_response({"ok": True, "order_number": order_number, "eta": eta})
+
+    return web.json_response({
+        "ok": True,
+        "order_number": order_number,
+        "eta": eta,
+        "screen_ok": bool(eta.get("screen_ok")),
+        "db_order_found": row is not None,
+    })
 
 
 async def http_mealpoint_subscription(request: web.Request) -> web.Response:
