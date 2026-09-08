@@ -132,6 +132,16 @@ PRINT_URL = os.getenv(
     "https://pseudosocially-tiddly-alysia.ngrok-free.dev/order",
 )
 
+# Сервис этикеток находится в той же чековой программе, что и /order.
+# Старые переменные поддерживаются, но если они не заданы, URL автоматически
+# строится из PRINT_URL: https://.../order -> https://.../grab-label.
+LABEL_SERVICE_URL = (
+    os.getenv("LABEL_SERVICE_URL")
+    or os.getenv("GRAB_LABEL_URL")
+    or os.getenv("GRAB_RECEIVER_URL")
+    or ""
+).strip()
+
 WEBSITE_ORDER_SECRET = os.getenv("WEBSITE_ORDER_SECRET", "").strip()
 MEALPOINT_BOT_SECRET = os.getenv("MEALPOINT_BOT_SECRET", "").strip()
 SCREEN_SERVICE_URL = os.getenv("SCREEN_SERVICE_URL", "https://screegrab-production.up.railway.app").strip().rstrip("/")
@@ -2598,6 +2608,98 @@ async def send_payload_to_receipt_program(
         raise last_error
 
     raise RuntimeError("Не удалось отправить заказ в чековую программу")
+
+
+
+def _label_service_endpoint() -> str:
+    """Возвращает /grab-label чековой программы без необходимости новой переменной."""
+    configured = safe_str(LABEL_SERVICE_URL, "").strip().rstrip("/")
+    if configured:
+        if configured.endswith("/grab") or configured.endswith("/grab-label"):
+            return configured
+        return configured + "/grab-label"
+
+    raw = safe_str(PRINT_URL, "").strip()
+    if not raw:
+        return ""
+
+    try:
+        parts = urlsplit(raw)
+        if parts.scheme and parts.netloc:
+            path = (parts.path or "").rstrip("/")
+            if path.endswith("/order"):
+                path = path[:-len("/order")]
+            path = path.rstrip("/") + "/grab-label"
+            return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    except Exception:
+        pass
+
+    raw = raw.rstrip("/")
+    if raw.endswith("/order"):
+        raw = raw[:-len("/order")]
+    return raw.rstrip("/") + "/grab-label"
+
+
+async def send_order_number_to_label_program(
+    order_number: str,
+    timeout_seconds: int = 12,
+) -> tuple[int, str]:
+    """
+    Передаёт номер SM-*/GF-* в старый рабочий /grab-label чековой программы.
+    Чековая программа сама сохраняет JSON+PNG в папку GRAB и ставит этикетку
+    в очередь NIIMBOT. Выполняется только после приёма полного заказа через /order.
+    """
+    number = safe_str(order_number, "").strip().upper()
+    if not re.fullmatch(r"(?:SM|GF)-[0-9]+", number):
+        raise ValueError(f"Неверный номер для этикетки: {number or 'EMPTY'}")
+
+    endpoint = _label_service_endpoint()
+    if not endpoint:
+        raise RuntimeError("Не удалось определить URL /grab-label чековой программы")
+
+    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+    last_error: Exception | None = None
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(2):
+            try:
+                async with session.post(
+                    endpoint,
+                    json={
+                        "order_number": number,
+                        "orderNumber": number,
+                        "order_no": number,
+                        "orderNo": number,
+                    },
+                ) as response:
+                    body = await response.text()
+                    if 200 <= response.status < 300:
+                        logger.info(
+                            "LABEL QUEUED: order=%s endpoint=%s response=%s",
+                            number,
+                            endpoint,
+                            body[:500],
+                        )
+                        return response.status, body
+
+                    error = RuntimeError(
+                        f"Этикетка: HTTP {response.status}: {body[:500]}"
+                    )
+                    if response.status in (502, 503, 504) and attempt == 0:
+                        last_error = error
+                        await asyncio.sleep(1)
+                        continue
+                    raise error
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                raise
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Не удалось поставить этикетку в очередь")
 
 
 # ============================================================================
@@ -5781,6 +5883,27 @@ async def handle_order(
             print_response[:500],
         )
 
+        # ВОЗВРАЩЕНО: после приёма заказа чековой программой создаём
+        # отдельную этикетку с тем же SM-* номером в папке GRAB и печатаем её.
+        try:
+            await send_order_number_to_label_program(
+                order_number,
+                timeout_seconds=7,
+            )
+        except Exception as label_exc:
+            logger.exception("LABEL DELIVERY FAILED: %s", order_number)
+            try:
+                await bot.send_message(
+                    ADMIN_CHAT_ID,
+                    (
+                        f"⚠️ Заказ {order_number} ушёл в чековую программу, "
+                        "но стикер с номером не поставлен в очередь печати.\n"
+                        f"Ошибка: {safe_str(label_exc)[:500]}"
+                    ),
+                )
+            except Exception:
+                pass
+
     except Exception as exc:
         logger.exception(
             (
@@ -6469,14 +6592,33 @@ async def http_website_order(request: web.Request) -> web.Response:
         "discount_amount":max(0,safe_int(data.get("bonus_used"),0)),"discount_percent":0,"total":total,
         "order_time":safe_str(data.get("order_time")),"order_when":safe_str(data.get("order_when")),"comment":safe_str(data.get("comment")),
     }
+    receipt_ok = False
     try:
         await send_payload_to_receipt_program(print_payload, timeout_seconds=7)
+        receipt_ok = True
     except Exception:
         logger.exception("Website order print failed")
         try:
             await bot.send_message(ADMIN_CHAT_ID, f"⚠️ {order_number}: заказ принят, но чековая программа недоступна.")
         except Exception:
             pass
+
+    # ВОЗВРАЩЕНО: Mini App -> tgfoodbot -> /order -> /grab-label.
+    # /grab-label создаёт JSON и PNG номера заказа в папке GRAB чековой программы
+    # и ставит стикер в очередь физической печати.
+    if receipt_ok:
+        try:
+            await send_order_number_to_label_program(order_number, timeout_seconds=7)
+        except Exception as label_exc:
+            logger.exception("Website order label failed: %s", order_number)
+            try:
+                await bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"⚠️ {order_number}: чек создан, но стикер не поставлен в очередь. Ошибка: {safe_str(label_exc)[:500]}",
+                )
+            except Exception:
+                pass
+
     return web.json_response({"ok": True, "order_number": order_number, "eta": eta})
 
 
