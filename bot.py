@@ -124,8 +124,16 @@ PRINT_URL = os.getenv(
 
 WEBSITE_ORDER_SECRET = os.getenv("WEBSITE_ORDER_SECRET", "").strip()
 MEALPOINT_BOT_SECRET = os.getenv("MEALPOINT_BOT_SECRET", "").strip()
-SCREEN_SERVICE_URL = os.getenv("SCREEN_SERVICE_URL", "").strip().rstrip("/")
-SCREEN_SERVICE_SECRET = os.getenv("SCREEN_SERVICE_SECRET", "").strip()
+DEFAULT_SCREEN_SERVICE_URL = "https://screegrab-production.up.railway.app"
+DEFAULT_SCREEN_SERVICE_SECRET = "SmokeFactoryScreenBridge_2026_v1"
+SCREEN_SERVICE_URL = (
+    os.getenv("SCREEN_SERVICE_URL", "").strip().rstrip("/")
+    or DEFAULT_SCREEN_SERVICE_URL
+)
+SCREEN_SERVICE_SECRET = (
+    os.getenv("SCREEN_SERVICE_SECRET", "").strip()
+    or DEFAULT_SCREEN_SERVICE_SECRET
+)
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini"
@@ -1167,8 +1175,10 @@ async def google_two_wheeler_minutes(lat: float, lng: float) -> int | None:
 
 
 async def send_order_to_screens(order_number: str, prep_minutes: int, items: list[dict], cutlery=None) -> bool:
-    if not SCREEN_SERVICE_URL or not SCREEN_SERVICE_SECRET:
-        logger.warning("SCREEN_SERVICE_URL/SCREEN_SERVICE_SECRET не настроены")
+    # SCREEN_SERVICE_URL имеет рабочий fallback на текущий Railway-сервис экранов.
+    # Поэтому обычный заказ не пропускается только из-за отсутствующей переменной Railway.
+    if not SCREEN_SERVICE_URL:
+        logger.error("SCREEN_SERVICE_URL пустой — заказ %s не может быть отправлен на экран", order_number)
         return False
     payload = {
         "orderNo": order_number,
@@ -1176,20 +1186,32 @@ async def send_order_to_screens(order_number: str, prep_minutes: int, items: lis
         "items": [{"name": safe_str(x.get("name")), "qty": max(1, safe_int(x.get("qty"), 1))} for x in items],
         "cutlery": cutlery if isinstance(cutlery, bool) else None,
     }
-    try:
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                SCREEN_SERVICE_URL + "/api/external-order",
-                json=payload,
-                headers={"X-Screen-Secret": SCREEN_SERVICE_SECRET},
-            ) as response:
-                body = await response.text()
-                if 200 <= response.status < 300:
-                    return True
-                logger.warning("Screen service HTTP %s: %s", response.status, body[:500])
-    except Exception:
-        logger.exception("Screen service request failed")
+    endpoint = SCREEN_SERVICE_URL + "/api/external-order"
+    headers = {"X-Screen-Secret": SCREEN_SERVICE_SECRET}
+
+    for attempt in (1, 2):
+        try:
+            timeout = aiohttp.ClientTimeout(total=12)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(endpoint, json=payload, headers=headers) as response:
+                    body = await response.text()
+                    if 200 <= response.status < 300:
+                        logger.info(
+                            "SCREEN OK order=%s prep=%s items=%s endpoint=%s",
+                            order_number, prep_minutes, len(payload["items"]), endpoint,
+                        )
+                        return True
+                    logger.error(
+                        "SCREEN HTTP %s order=%s attempt=%s body=%s",
+                        response.status, order_number, attempt, body[:500],
+                    )
+        except Exception:
+            logger.exception(
+                "Screen service request failed order=%s attempt=%s endpoint=%s",
+                order_number, attempt, endpoint,
+            )
+        if attempt == 1:
+            await asyncio.sleep(1.0)
     return False
 
 
