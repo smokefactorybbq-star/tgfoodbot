@@ -11,6 +11,7 @@ import hashlib
 import logging
 import asyncio
 import threading
+import re
 
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -120,6 +121,30 @@ PRINT_URL = os.getenv(
 )
 
 
+# New integrations are optional and do not replace the old Mini App / polling logic.
+WEBSITE_ORDER_SECRET = os.getenv("WEBSITE_ORDER_SECRET", "").strip()
+
+DEFAULT_SCREEN_SERVICE_URL = "https://screegrab-production.up.railway.app"
+SCREEN_SERVICE_URL = os.getenv(
+    "SCREEN_SERVICE_URL",
+    DEFAULT_SCREEN_SERVICE_URL,
+).rstrip("/")
+SCREEN_SERVICE_SECRET = os.getenv("SCREEN_SERVICE_SECRET", "").strip()
+
+GOOGLE_MAPS_API_KEY = (
+    os.getenv("GOOGLE_ROUTES_API_KEY")
+    or os.getenv("GOOGLE_MAPS_API_KEY")
+    or os.getenv("NEXT_PUBLIC_GOOGLE_MAPS_API_KEY")
+    or ""
+).strip()
+
+CAFE_LATITUDE = float(os.getenv("CAFE_LATITUDE", "7.910335"))
+CAFE_LONGITUDE = float(os.getenv("CAFE_LONGITUDE", "98.368771"))
+
+PREP_BUFFER_MINUTES = 10
+DELIVERY_BUFFER_MINUTES = 10
+
+
 # ============================================================================
 # ИНИЦИАЛИЗАЦИЯ
 # ============================================================================
@@ -167,6 +192,15 @@ BROADCAST_DELAY = 0.06
 
 
 db_pool: asyncpg.Pool | None = None
+
+# Event loop is saved for the small HTTP endpoint used by smokefactorybbq.com.
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+# PromptPay receipt reminders are deliberately kept in memory. A redeploy may
+# cancel a reminder, but it never cancels or loses the order itself.
+pending_receipt_tasks: dict[str, asyncio.Task] = {}
+pending_promptpay_by_user: dict[int, str] = {}
+receipt_received_orders: set[str] = set()
 
 
 TIMEZONE = ZoneInfo(
@@ -455,6 +489,21 @@ async def init_database() -> None:
 
             ALTER TABLE orders
             ADD COLUMN IF NOT EXISTS loyalty_request_id TEXT;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS fulfillment_type TEXT NOT NULL DEFAULT 'DELIVERY';
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS customer_latitude DOUBLE PRECISION;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS customer_longitude DOUBLE PRECISION;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS receipt_received_at TIMESTAMPTZ;
+
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS tracking_url TEXT;
 
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_number
@@ -1035,6 +1084,481 @@ def discount_by_spend(
 
 
 # ============================================================================
+# НОВЫЙ АВТОМАТИЧЕСКИЙ ПОТОК ЗАКАЗА
+# Добавлен поверх старой логики: старые handlers, polling, бонусы и Mini App
+# не заменяются.
+# ============================================================================
+
+def normalize_payment_name(value: object) -> str:
+    raw = safe_str(value, "").strip().lower().replace(" ", "").replace("-", "")
+    if raw in {"promptpay", "promtpay", "thaibank", "thai", "true", "truemoney"}:
+        return "PromptPay"
+    if raw in {"cash", "наличные", "кэш"}:
+        return "Cash"
+    return safe_str(value, "PromptPay") or "PromptPay"
+
+
+def normalize_fulfillment(value: object) -> str:
+    return "PICKUP" if safe_str(value, "").upper() == "PICKUP" else "DELIVERY"
+
+
+def dish_prep_minutes(name: str) -> int:
+    n = safe_str(name, "").lower().replace("ё", "е")
+
+    if any(x in n for x in (
+        "борщ", "солянка", "гороховый суп", "грибной суп", "окрошка", "куриный суп",
+    )):
+        return 10
+
+    if any(x in n for x in (
+        "салат", "цезарь", "обжор", "столич", "деревен", "баклаж",
+    )):
+        return 15
+
+    if "пельмен" in n or "вареник" in n:
+        return 20
+
+    if "лепеш" in n:
+        return 16
+
+    if "киев" in n:
+        return 22
+
+    if "чебур" in n:
+        return 20
+
+    if "фри" in n or "дольк" in n:
+        return 16
+
+    if "зраз" in n or "драник" in n:
+        return 24
+
+    if "ребр" in n:
+        return 12
+
+    # По согласованным временам: курица — 28, остальные шашлыки/кебабы — 30.
+    if "шашлык из курицы" in n or "кебаб из курицы" in n:
+        return 28
+
+    if "шашлык" in n or "кебаб" in n or "крыл" in n:
+        return 30
+
+    if any(x in n for x in ("котлет", "перец", "беф", "голуб")):
+        return 13
+
+    return 13
+
+
+def calculate_prep_minutes(order_items: list[dict]) -> int:
+    longest = 5
+    for item in order_items or []:
+        longest = max(longest, dish_prep_minutes(safe_str(item.get("name"), "")))
+    return longest + PREP_BUFFER_MINUTES
+
+
+def payload_coordinates(data: dict) -> tuple[float | None, float | None]:
+    location = data.get("location") if isinstance(data.get("location"), dict) else {}
+    raw_lat = data.get("latitude", data.get("customer_latitude", location.get("lat")))
+    raw_lng = data.get("longitude", data.get("customer_longitude", location.get("lng")))
+    try:
+        lat = float(raw_lat)
+        lng = float(raw_lng)
+        if -90 <= lat <= 90 and -180 <= lng <= 180:
+            return lat, lng
+    except (TypeError, ValueError):
+        pass
+    return None, None
+
+
+async def geocode_delivery_address(address: str) -> tuple[float | None, float | None]:
+    if not GOOGLE_MAPS_API_KEY or not address.strip():
+        return None, None
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=6)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://maps.googleapis.com/maps/api/geocode/json",
+                params={"address": address, "key": GOOGLE_MAPS_API_KEY},
+            ) as response:
+                if response.status != 200:
+                    return None, None
+                body = await response.json(content_type=None)
+                results = body.get("results") or []
+                if not results:
+                    return None, None
+                location = results[0].get("geometry", {}).get("location", {})
+                lat = float(location.get("lat"))
+                lng = float(location.get("lng"))
+                return lat, lng
+    except Exception as exc:
+        logger.warning("Google geocoding failed: %s", exc)
+        return None, None
+
+
+async def google_two_wheeler_minutes(
+    destination_lat: float,
+    destination_lng: float,
+) -> int | None:
+    if not GOOGLE_MAPS_API_KEY:
+        return None
+
+    payload = {
+        "origin": {
+            "location": {
+                "latLng": {
+                    "latitude": CAFE_LATITUDE,
+                    "longitude": CAFE_LONGITUDE,
+                }
+            }
+        },
+        "destination": {
+            "location": {
+                "latLng": {
+                    "latitude": destination_lat,
+                    "longitude": destination_lng,
+                }
+            }
+        },
+        "travelMode": "TWO_WHEELER",
+        "routingPreference": "TRAFFIC_AWARE",
+        "computeAlternativeRoutes": False,
+        "languageCode": "ru",
+        "units": "METRIC",
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=7)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://routes.googleapis.com/directions/v2:computeRoutes",
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Goog-Api-Key": GOOGLE_MAPS_API_KEY,
+                    "X-Goog-FieldMask": "routes.duration",
+                },
+            ) as response:
+                if response.status != 200:
+                    logger.warning("Google Routes HTTP %s: %s", response.status, (await response.text())[:300])
+                    return None
+                body = await response.json(content_type=None)
+                routes = body.get("routes") or []
+                if not routes:
+                    return None
+                duration = safe_str(routes[0].get("duration"), "")
+                match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)s", duration)
+                if not match:
+                    return None
+                seconds = float(match.group(1))
+                return max(1, int((seconds + 59) // 60))
+    except Exception as exc:
+        logger.warning("Google Routes failed: %s", exc)
+        return None
+
+
+async def calculate_order_eta(
+    data: dict,
+    order_items: list[dict],
+) -> dict:
+    prep_minutes = calculate_prep_minutes(order_items)
+    fulfillment = normalize_fulfillment(
+        data.get("fulfillmentType", data.get("fulfillment_type"))
+    )
+
+    result = {
+        "prep_minutes": prep_minutes,
+        "travel_minutes": None,
+        "delivery_minutes": None,
+        "eta_minutes": prep_minutes,
+        "fulfillment": fulfillment,
+    }
+
+    if fulfillment == "PICKUP":
+        return result
+
+    lat, lng = payload_coordinates(data)
+    if lat is None or lng is None:
+        address_plain = safe_str(
+            data.get("address_plain") or data.get("address"),
+            "",
+        )
+        lat, lng = await geocode_delivery_address(address_plain)
+
+    if lat is not None and lng is not None:
+        travel = await google_two_wheeler_minutes(lat, lng)
+        if travel is not None:
+            result["travel_minutes"] = travel
+            result["delivery_minutes"] = travel + DELIVERY_BUFFER_MINUTES
+            result["eta_minutes"] = prep_minutes + travel + DELIVERY_BUFFER_MINUTES
+
+    return result
+
+
+def eta_client_line(eta: dict) -> str:
+    if eta.get("fulfillment") == "PICKUP":
+        return (
+            f"Расчётное время приготовления: {eta['prep_minutes']} мин., "
+            "но мы постараемся как можно быстрее."
+        )
+
+    if eta.get("travel_minutes") is not None:
+        return (
+            f"Расчётное время доставки: {eta['eta_minutes']} мин., "
+            "но мы постараемся как можно быстрее. "
+            "Как курьер будет выезжать, я вам сообщу."
+        )
+
+    return (
+        f"Расчётное время приготовления: {eta['prep_minutes']} мин. "
+        "Точное время дороги не удалось получить автоматически, "
+        "но мы постараемся как можно быстрее. Как курьер будет выезжать, я вам сообщу."
+    )
+
+
+async def send_order_to_screen(
+    order_number: str,
+    prep_minutes: int,
+    order_items: list[dict],
+    cutlery: bool | None = None,
+) -> bool:
+    screen_bases: list[str] = []
+    for candidate in (SCREEN_SERVICE_URL, DEFAULT_SCREEN_SERVICE_URL):
+        base = safe_str(candidate, "").rstrip("/")
+        if base and base not in screen_bases:
+            screen_bases.append(base)
+    if not screen_bases:
+        return False
+
+    headers = {"Content-Type": "application/json"}
+    if SCREEN_SERVICE_SECRET:
+        headers["X-Screen-Secret"] = SCREEN_SERVICE_SECRET
+
+    body = {
+        "orderNo": order_number,
+        "prepMinutes": prep_minutes,
+        "items": [
+            {
+                "name": safe_str(item.get("name"), ""),
+                "qty": max(1, safe_int(item.get("qty"), 1)),
+            }
+            for item in order_items
+        ],
+        "cutlery": cutlery,
+    }
+
+    # Try the configured URL first and the known working Screencook URL second.
+    # This makes old/stale Railway variables non-fatal.
+    for base in screen_bases:
+        url = f"{base}/api/external-order"
+        for attempt in range(2):
+            try:
+                timeout = aiohttp.ClientTimeout(total=4)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(url, json=body, headers=headers) as response:
+                        text = await response.text()
+                        if 200 <= response.status < 300:
+                            logger.info("SCREEN ORDER OK: %s -> %s", order_number, base)
+                            return True
+                        logger.warning("SCREEN ORDER HTTP %s (%s): %s", response.status, base, text[:300])
+            except Exception as exc:
+                logger.warning("SCREEN ORDER %s attempt %s failed: %s", base, attempt + 1, exc)
+            if attempt == 0:
+                await asyncio.sleep(0.8)
+    return False
+
+
+async def latest_promptpay_order_for_user(telegram_id: int) -> str:
+    memory_order = pending_promptpay_by_user.get(telegram_id)
+    if memory_order:
+        return memory_order
+    if not db_pool:
+        return ""
+    try:
+        row = await db_pool.fetchrow(
+            """
+            SELECT order_number
+            FROM orders
+            WHERE telegram_id=$1
+              AND LOWER(COALESCE(payment_method,'')) IN ('promptpay','promtpay','thaibank','thai bank')
+              AND created_at > NOW() - INTERVAL '6 hours'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            telegram_id,
+        )
+        return safe_str(row["order_number"], "") if row else ""
+    except Exception as exc:
+        logger.warning("Receipt order lookup failed: %s", exc)
+        return ""
+
+
+async def mark_receipt_received(order_number: str) -> None:
+    if not order_number:
+        return
+    receipt_received_orders.add(order_number)
+    task = pending_receipt_tasks.pop(order_number, None)
+    if task and not task.done():
+        task.cancel()
+    if db_pool:
+        try:
+            await db_pool.execute(
+                "UPDATE orders SET receipt_received_at=NOW() WHERE order_number=$1",
+                order_number,
+            )
+        except Exception as exc:
+            logger.warning("Could not mark receipt in DB: %s", exc)
+
+
+async def receipt_reminder_worker(telegram_id: int, order_number: str) -> None:
+    try:
+        await asyncio.sleep(300)
+        if order_number in receipt_received_orders:
+            return
+        if db_pool:
+            try:
+                received = await db_pool.fetchval(
+                    "SELECT receipt_received_at IS NOT NULL FROM orders WHERE order_number=$1",
+                    order_number,
+                )
+                if received:
+                    return
+            except Exception:
+                pass
+        await bot.send_message(
+            telegram_id,
+            "Не забудьте отправить мне чек об оплате пожалуйста.",
+        )
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        logger.warning("Receipt reminder failed: %s", exc)
+    finally:
+        pending_receipt_tasks.pop(order_number, None)
+
+
+def schedule_receipt_reminder(telegram_id: int, order_number: str, payment: str) -> None:
+    if normalize_payment_name(payment) != "PromptPay" or not order_number:
+        return
+    pending_promptpay_by_user[telegram_id] = order_number
+    previous = pending_receipt_tasks.pop(order_number, None)
+    if previous and not previous.done():
+        previous.cancel()
+    pending_receipt_tasks[order_number] = asyncio.create_task(
+        receipt_reminder_worker(telegram_id, order_number)
+    )
+
+
+async def process_website_order(payload: dict) -> dict:
+    """Processes an order already saved by smokefactorybbq.com.
+
+    This does not create a second DB order or change the old Mini App handler.
+    """
+    order_number = safe_str(
+        payload.get("order_number") or payload.get("orderNumber"),
+        "",
+    ).strip().upper()
+    telegram_id = safe_int(payload.get("telegram_id"), 0)
+    source_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    order_items = []
+    for item in source_items:
+        if not isinstance(item, dict):
+            continue
+        name = safe_str(item.get("name"), "").strip()
+        qty = max(1, safe_int(item.get("qty"), 1))
+        if name:
+            order_items.append({
+                "name": name,
+                "qty": qty,
+                "price": max(0, safe_int(item.get("price"), 0)),
+                "img": safe_str(item.get("img"), ""),
+            })
+
+    if not order_number or not order_items:
+        raise ValueError("order_number and items are required")
+
+    eta = await calculate_order_eta(payload, order_items)
+    screen_ok = await send_order_to_screen(
+        order_number,
+        int(eta["prep_minutes"]),
+        order_items,
+        payload.get("cutlery") if isinstance(payload.get("cutlery"), bool) else None,
+    )
+
+    customer_name = safe_str(payload.get("name"), "Клиент")
+    phone = safe_str(payload.get("phone"), "")
+    address_plain = safe_str(payload.get("address_plain") or payload.get("address"), "")
+    payment = normalize_payment_name(payload.get("payment") or payload.get("payMethod"))
+    total = max(0, safe_int(payload.get("total"), 0))
+    fulfillment = normalize_fulfillment(payload.get("fulfillment_type") or payload.get("fulfillmentType"))
+
+    if telegram_id:
+        text = (
+            f"📦 Ваш заказ {order_number} принят и уже готовится!\n\n"
+            f"{eta_client_line(eta)}\n\n"
+            f"💰 Итого: {total} ฿\n"
+            f"Оплата: {payment}"
+        )
+        await bot.send_message(telegram_id, text)
+        schedule_receipt_reminder(telegram_id, order_number, payment)
+
+    admin_lines = [
+        f"✅ <b>Новый заказ {html.escape(order_number)}</b>",
+        f"Клиент: {html.escape(customer_name)}",
+        f"Телефон: {html.escape(phone)}",
+        f"Получение: {'Самовывоз' if fulfillment == 'PICKUP' else 'Доставка'}",
+    ]
+    if address_plain:
+        admin_lines.append(f"Адрес: {html.escape(address_plain)}")
+    admin_lines.append(f"Приготовление: {eta['prep_minutes']} мин")
+    if eta.get("travel_minutes") is not None:
+        admin_lines.append(f"Google мото: {eta['travel_minutes']} мин + {DELIVERY_BUFFER_MINUTES} мин")
+    admin_lines.append("\n🍽 <b>Состав:</b>")
+    for item in order_items:
+        admin_lines.append(f"• {html.escape(item['name'])} ×{item['qty']}")
+    admin_lines.append(f"\n💰 <b>Итого: {total} ฿</b>")
+
+    try:
+        await bot.send_message(ADMIN_CHAT_ID, "\n".join(admin_lines), parse_mode="HTML")
+    except Exception:
+        logger.exception("Website order manager message failed")
+
+    print_payload = dict(payload)
+    print_payload.update({
+        "order_number": order_number,
+        "orderNumber": order_number,
+        "orderNo": order_number,
+        "payment": payment,
+        "items": order_items,
+        "name": customer_name,
+        "phone": phone,
+        "address": safe_str(payload.get("address"), address_plain),
+        "address_plain": address_plain,
+        "fulfillment_type": fulfillment,
+        "prep_minutes": int(eta["prep_minutes"]),
+        "travel_minutes": eta.get("travel_minutes"),
+        "eta_minutes": eta.get("eta_minutes"),
+    })
+
+    print_ok = False
+    try:
+        await send_payload_to_receipt_program(print_payload, timeout_seconds=8)
+        print_ok = True
+    except Exception as exc:
+        logger.warning("Website order print failed: %s", exc)
+
+    return {
+        "ok": True,
+        "orderNumber": order_number,
+        "screenDelivered": screen_ok,
+        "printDelivered": print_ok,
+        "prepMinutes": eta["prep_minutes"],
+        "travelMinutes": eta.get("travel_minutes"),
+        "etaMinutes": eta.get("eta_minutes"),
+    }
+
+
+# ============================================================================
 # HEALTHCHECK И ПЛАНОВЫЙ ПЕРЕЗАПУСК
 # ============================================================================
 
@@ -1044,16 +1568,71 @@ def run_fake_server(
     class Handler(
         BaseHTTPRequestHandler
     ):
-        def do_GET(self) -> None:
-            self.send_response(
-                200
-            )
-
+        def _json(self, status: int, payload: dict) -> None:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
+            self.wfile.write(raw)
 
-            self.wfile.write(
-                b"OK"
+        def do_GET(self) -> None:
+            self._json(
+                200,
+                {
+                    "ok": True,
+                    "service": "tgfoodbot",
+                    "screenServiceUrl": SCREEN_SERVICE_URL,
+                    "googleRoutesConfigured": bool(GOOGLE_MAPS_API_KEY),
+                },
             )
+
+        def do_POST(self) -> None:
+            if self.path.rstrip("/") != "/website-order":
+                self._json(404, {"ok": False, "error": "Not found"})
+                return
+
+            supplied_secret = self.headers.get("X-Website-Order-Secret", "")
+            if WEBSITE_ORDER_SECRET and not hmac.compare_digest(
+                supplied_secret, WEBSITE_ORDER_SECRET
+            ):
+                self._json(401, {"ok": False, "error": "Unauthorized"})
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                content_length = 0
+
+            if content_length <= 0 or content_length > 1_000_000:
+                self._json(400, {"ok": False, "error": "Invalid body"})
+                return
+
+            try:
+                raw = self.rfile.read(content_length)
+                payload = json.loads(raw.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON object expected")
+            except Exception as exc:
+                self._json(400, {"ok": False, "error": f"Invalid JSON: {exc}"})
+                return
+
+            if MAIN_LOOP is None:
+                self._json(503, {"ok": False, "error": "Bot loop is not ready"})
+                return
+
+            future = asyncio.run_coroutine_threadsafe(
+                process_website_order(payload),
+                MAIN_LOOP,
+            )
+            try:
+                result = future.result(timeout=24)
+                self._json(200, result)
+            except Exception as exc:
+                future.cancel()
+                logger.exception("/website-order failed")
+                self._json(500, {"ok": False, "error": str(exc)[:500]})
 
         def log_message(
             self,
@@ -1722,12 +2301,16 @@ async def save_order_to_database(
                     order_when,
                     order_date,
                     order_time,
-                    comment
+                    comment,
+                    fulfillment_type,
+                    customer_latitude,
+                    customer_longitude
                 )
                 VALUES (
                     $1,$2,$3,$4,$5,$6,
                     $7,$8,$9,$10,$11,
-                    $12,$13,$14,$15,$16
+                    $12,$13,$14,$15,$16,
+                    $17,$18,$19
                 )
                 RETURNING id
                 """,
@@ -1778,6 +2361,11 @@ async def save_order_to_database(
                         "note"
                     )
                 ),
+                normalize_fulfillment(
+                    data.get("fulfillmentType", data.get("fulfillment_type"))
+                ),
+                payload_coordinates(data)[0],
+                payload_coordinates(data)[1],
             )
 
             if order_items:
@@ -1852,6 +2440,9 @@ async def build_print_payload_from_database(
                 order_date,
                 order_time,
                 comment,
+                fulfillment_type,
+                customer_latitude,
+                customer_longitude,
                 created_at
             FROM orders
             WHERE id = $1
@@ -1963,6 +2554,12 @@ async def build_print_payload_from_database(
         "payment": safe_str(
             order_row["payment_method"]
         ),
+        "fulfillment_type": safe_str(
+            order_row["fulfillment_type"],
+            "DELIVERY",
+        ),
+        "customer_latitude": order_row["customer_latitude"],
+        "customer_longitude": order_row["customer_longitude"],
         "items": items,
 
         "items_total": max(
@@ -4976,11 +5573,35 @@ async def handle_order(
         return
 
     # --------------------------------------------------------
+    # НОВОЕ: время приготовления + автоматическая отправка на старые экраны.
+    # Ошибка экрана не отменяет уже сохранённый заказ.
+    # --------------------------------------------------------
+    eta = await calculate_order_eta(data, order_items)
+    screen_ok = await send_order_to_screen(
+        order_number,
+        int(eta["prep_minutes"]),
+        order_items,
+        data.get("cutlery") if isinstance(data.get("cutlery"), bool) else None,
+    )
+    if not screen_ok:
+        logger.warning("Заказ %s не подтверждён экраном", order_number)
+        try:
+            await bot.send_message(
+                ADMIN_CHAT_ID,
+                f"⚠️ Заказ {order_number} принят, но экран кухни не подтвердил получение.",
+            )
+        except Exception:
+            pass
+
+    schedule_receipt_reminder(client_id, order_number, pay_method)
+
+    # --------------------------------------------------------
     # СООБЩЕНИЕ КЛИЕНТУ
     # --------------------------------------------------------
 
     client_text = (
-        f"📦 Ваш заказ {order_number} принят!\n\n"
+        f"📦 Ваш заказ {order_number} принят и уже готовится!\n\n"
+        f"{eta_client_line(eta)}\n\n"
 
         f"Имя: "
         f"{data.get('name') or username}\n"
@@ -5221,6 +5842,15 @@ async def handle_order(
         # и с доставкой.
         "total": total,
 
+        "fulfillment_type": normalize_fulfillment(
+            data.get("fulfillmentType", data.get("fulfillment_type"))
+        ),
+        "customer_latitude": payload_coordinates(data)[0],
+        "customer_longitude": payload_coordinates(data)[1],
+        "prep_minutes": int(eta["prep_minutes"]),
+        "travel_minutes": eta.get("travel_minutes"),
+        "eta_minutes": eta.get("eta_minutes"),
+
         "date": datetime.now(
             TIMEZONE
         ).strftime(
@@ -5329,6 +5959,66 @@ async def handle_order(
 
 
 # ============================================================================
+# ЧЕКИ ОПЛАТЫ ОТ КЛИЕНТОВ
+# Старый заказной handler не меняется: эти handlers срабатывают только на
+# фото/документы обычного клиента.
+# ============================================================================
+
+async def handle_customer_receipt_message(message: types.Message) -> None:
+    telegram_id = message.from_user.id
+    order_number = await latest_promptpay_order_for_user(telegram_id)
+
+    if message.document:
+        mime = safe_str(message.document.mime_type, "").lower()
+        if mime and mime != "application/pdf" and not mime.startswith("image/"):
+            await message.answer("Пожалуйста, пришлите чек фотографией или PDF-файлом.")
+            return
+
+    if order_number:
+        await mark_receipt_received(order_number)
+        if pending_promptpay_by_user.get(telegram_id) == order_number:
+            pending_promptpay_by_user.pop(telegram_id, None)
+
+    header = (
+        f"🧾 Чек от клиента\n"
+        f"Заказ: {order_number or 'не удалось определить'}\n"
+        f"Telegram ID: {telegram_id}"
+    )
+
+    try:
+        await bot.send_message(ADMIN_CHAT_ID, header)
+        await bot.copy_message(
+            chat_id=ADMIN_CHAT_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+        await message.answer(
+            "Спасибо! Чек получил и сразу передал менеджеру."
+        )
+    except Exception:
+        logger.exception("Не удалось переслать чек менеджеру")
+        await message.answer(
+            "Чек получил, но сейчас не удалось передать его менеджеру автоматически. Попробуйте ещё раз через минуту."
+        )
+
+
+@dp.message(
+    F.photo,
+    F.from_user.id != ADMIN_CHAT_ID,
+)
+async def customer_receipt_photo(message: types.Message) -> None:
+    await handle_customer_receipt_message(message)
+
+
+@dp.message(
+    F.document,
+    F.from_user.id != ADMIN_CHAT_ID,
+)
+async def customer_receipt_document(message: types.Message) -> None:
+    await handle_customer_receipt_message(message)
+
+
+# ============================================================================
 # СООБЩЕНИЯ АДМИНИСТРАТОРА
 # ============================================================================
 
@@ -5348,6 +6038,54 @@ async def admin_message_router(
         )
     ):
         return
+
+    # --------------------------------------------------------
+    # Ссылка отслеживания такси: SM-877 https://...
+    # --------------------------------------------------------
+    if message.text:
+        tracking_match = re.fullmatch(
+            r"\s*(SM-\d+)\s+(https?://\S+)\s*",
+            message.text,
+            flags=re.IGNORECASE,
+        )
+        if tracking_match:
+            order_number = tracking_match.group(1).upper()
+            tracking_url = tracking_match.group(2)
+            telegram_id = None
+            if db_pool:
+                row = await db_pool.fetchrow(
+                    "SELECT telegram_id FROM orders WHERE order_number=$1 LIMIT 1",
+                    order_number,
+                )
+                if row:
+                    telegram_id = int(row["telegram_id"])
+                    try:
+                        await db_pool.execute(
+                            "UPDATE orders SET tracking_url=$2 WHERE order_number=$1",
+                            order_number,
+                            tracking_url,
+                        )
+                    except Exception:
+                        pass
+
+            if not telegram_id:
+                await message.answer(f"⚠️ Заказ {order_number} не найден в базе.")
+                return
+
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    (
+                        f"🚚 Курьер выехал с заказом {order_number}.\n"
+                        f"Следить за доставкой: {tracking_url}"
+                    ),
+                    disable_web_page_preview=True,
+                )
+                await message.answer(f"✅ Ссылка отправлена клиенту {order_number}.")
+            except Exception as exc:
+                logger.exception("Tracking link send failed")
+                await message.answer(f"⚠️ Не удалось отправить ссылку: {exc}")
+            return
 
     # --------------------------------------------------------
     # /bonus
@@ -5717,6 +6455,9 @@ async def ensure_keyboard_if_missing(
 # ============================================================================
 
 async def main() -> None:
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+
     logger.info(
         "=== Запуск бота Smoke Factory BBQ ==="
     )

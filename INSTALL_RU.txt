@@ -1,0 +1,84 @@
+SMOKE FACTORY — ПРОВЕРЕННАЯ СБОРКА 08.09.2026
+
+ВАЖНО: это 4 ОТДЕЛЬНЫХ проекта/сервиса. Не объединяйте BOT_TOKEN двух ботов.
+
+1) Screencook / screegrab — отдельный Node/Telegraf бот + кухня + курьеры
+   Railway start: node index.js
+   Переменные:
+     BOT_TOKEN=<ТОКЕН ВТОРОГО БОТА, который читает скриншоты>
+     PUBLIC_URL=https://screegrab-production.up.railway.app
+     WEBHOOK_SECRET=<ваш существующий секрет>
+     OPENAI_API_KEY=<OpenAI API key для чтения скриншотов>
+     MANAGER_IDS=<telegram id менеджера, как было раньше>
+     GRAB_RECEIVER_URL=<ваш старый адрес чековой/label программы, если используется>
+   SCREEN_SERVICE_SECRET необязателен.
+   SCREEN_REQUIRE_SECRET по умолчанию НЕ нужен. Если поставить SCREEN_REQUIRE_SECRET=1,
+   тогда SCREEN_SERVICE_SECRET должен совпадать у отправителя и Screencook.
+
+   Проверка:
+     /health
+     /screen.html
+     /courier.html
+   В Telegram второго бота после /start должны быть:
+     🧾 Новый заказ
+     📸 Новый заказ screenshot
+
+2) Основной tgfoodbot — Python/aiogram, старый polling сохранён
+   Переменные как раньше:
+     TELEGRAM_BOT_TOKEN=<ТОКЕН ОСНОВНОГО ПОЛЬЗОВАТЕЛЬСКОГО БОТА>
+     DATABASE_URL=<старая БД>
+     ADMIN_CHAT_ID=<менеджер>
+     WEBAPP_URL=<URL Mini App>
+     PRINT_URL=<URL чековой программы>
+   Для новых функций:
+     GOOGLE_MAPS_API_KEY=<server key с Routes + Geocoding>   (не обязателен для создания заказа)
+     SCREEN_SERVICE_URL=https://screegrab-production.up.railway.app   (можно не задавать: этот URL уже fallback)
+     WEBSITE_ORDER_SECRET=<одинаковый с сайтом, если используете защиту /website-order>
+   BOT_TOKEN здесь НЕ нужен.
+
+3) Mini App
+   Старый Telegram sendData -> основной tgfoodbot сохранён.
+   Переменные как раньше:
+     DATABASE_URL
+     TELEGRAM_BOT_TOKEN=<ТОКЕН ОСНОВНОГО БОТА>
+   Для карты можно задать одно из:
+     NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+     GOOGLE_MAPS_BROWSER_KEY
+     GOOGLE_MAPS_API_KEY
+   В коде также оставлен старый browser-key fallback.
+   Точка на карте НЕ обязательна. Для доставки достаточно адреса.
+
+4) smokefactorybbq.com
+   Существующие DB/Telegram auth variables оставьте как есть.
+   Новое/важное:
+     TELEGRAM_BOT_ORDER_URL=https://<ОСНОВНОЙ-TGFOODBOT>/website-order
+     WEBSITE_ORDER_SECRET=<тот же, что в основном боте, если задан>
+     NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=<browser key> (или GOOGLE_MAPS_BROWSER_KEY / GOOGLE_MAPS_API_KEY)
+     SCREEN_SERVICE_URL=https://screegrab-production.up.railway.app (необязательно — URL уже fallback)
+   Точка на карте НЕ обязательна. Адрес доставки остаётся обязательным.
+
+QR:
+   НИКАКОЙ генерации суммы внутри QR больше нет.
+   Сайт использует /promptpay-qr.jpg
+   Mini App использует /images/promptpay-qr.jpg
+   Эти картинки НЕ включены в архивы, потому что вы сказали, что картинки не менялись.
+   НЕ удаляйте существующие папки images/public и promptpay-qr.jpg при загрузке кода поверх ветки.
+
+КРИТИЧЕСКИ ВАЖНО ПРО ДВА БОТА:
+   Основной бот: TELEGRAM_BOT_TOKEN = токен основного бота.
+   Screencook: BOT_TOKEN = токен второго бота скриншотов.
+   ТОКЕНЫ ДОЛЖНЫ БЫТЬ РАЗНЫЕ.
+
+Что проверено перед упаковкой:
+   - Python bot.py: py_compile — PASS (несколько запусков)
+   - Screencook index.js и index_screen_fixed.js: node --check — PASS
+   - Mini App server.js + JS из index.html: node --check — PASS
+   - JS из shop.html: node --check — PASS
+   - TypeScript изменённых routes: parse errors = 0
+   - старые screenshot OCR handlers присутствуют
+   - RU/ไทย и старые цвета кухни присутствуют
+   - /screen.html и /courier.html присутствуют
+   - карта не участвует в canCheckout
+   - static PromptPay modal присутствует, dynamic QR endpoint удалён
+   - 20 тестов времени приготовления — PASS
+   - 31 название блюда сайта сопоставлено со старыми названиями экрана — PASS
