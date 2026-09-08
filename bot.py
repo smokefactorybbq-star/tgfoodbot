@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import time
+import uuid
 import hmac
 import html
 import base64
@@ -109,10 +110,19 @@ WEBAPP_URL = os.getenv(
     "https://mini-app-production-67f2.up.railway.app",
 ).rstrip("/")
 
+_webapp_parts = urlsplit(WEBAPP_URL)
+MINI_APP_API_URL = (
+    f"{_webapp_parts.scheme}://{_webapp_parts.netloc}"
+    if _webapp_parts.scheme and _webapp_parts.netloc
+    else WEBAPP_URL
+).rstrip("/")
+
 
 MENU_BTN_TEXT = "📋 Открыть меню"
 
 ASK_BTN_TEXT = "💬 Задать вопрос менеджеру"
+
+RATE_BTN_TEXT = "Курс"
 
 
 LOYALTY_SETTLE_URL = f"{WEBAPP_URL}/api/loyalty/settle"
@@ -157,6 +167,9 @@ waiting_reply: dict[
 
 # Менеджер готовит рекламную рассылку.
 waiting_broadcast: set[int] = set()
+
+# Менеджер вводит курс рублей за 1 бат.
+waiting_rate: set[int] = set()
 
 
 # Подготовленное сообщение для рассылки.
@@ -1330,6 +1343,65 @@ async def ask_openai_customer(question: str) -> tuple[str, float, bool]:
         logger.exception("OpenAI customer answer failed")
         return "",0.0,True
 
+async def save_rub_rate(
+    rate: float,
+    manager_id: int,
+) -> dict:
+    """Сохраняет курс RUB/THB в Mini App через защищённый HMAC API."""
+    timestamp = int(time.time())
+    request_id = (
+        f"rate:{manager_id}:{timestamp}:"
+        f"{uuid.uuid4().hex}"
+    )
+
+    canonical = "|".join(
+        [
+            f"{rate:.4f}",
+            str(manager_id),
+            str(timestamp),
+            request_id,
+        ]
+    )
+
+    signature = hmac.new(
+        API_TOKEN.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    payload = {
+        "rate": rate,
+        "managerId": manager_id,
+        "timestamp": timestamp,
+        "requestId": request_id,
+    }
+
+    timeout = aiohttp.ClientTimeout(total=15)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.post(
+            f"{MINI_APP_API_URL}/api/admin/exchange-rate",
+            json=payload,
+            headers={
+                "X-Rate-Signature": signature
+            },
+        ) as response:
+            raw = await response.text()
+
+            try:
+                data = json.loads(raw or "{}")
+            except Exception:
+                data = {}
+
+            if response.status != 200 or not data.get("ok"):
+                raise RuntimeError(
+                    safe_str(data.get("error"), "").strip()
+                    or f"HTTP {response.status}: {raw[:300]}"
+                )
+
+            return data
+
+
 def is_admin(
     telegram_id: int,
 ) -> bool:
@@ -1585,15 +1657,27 @@ def start_keyboard(
         text=ASK_BTN_TEXT
     )
 
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                web_app_btn
-            ],
-            [
-                ask_btn
-            ],
+    keyboard_rows = [
+        [
+            web_app_btn
         ],
+        [
+            ask_btn
+        ],
+    ]
+
+    # Кнопка «Курс» видна только менеджеру.
+    if int(user.id) == int(ADMIN_CHAT_ID):
+        keyboard_rows.append(
+            [
+                types.KeyboardButton(
+                    text=RATE_BTN_TEXT
+                )
+            ]
+        )
+
+    return types.ReplyKeyboardMarkup(
+        keyboard=keyboard_rows,
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -4876,6 +4960,13 @@ async def cmd_cancel(
 
         cancelled = True
 
+    if admin_id in waiting_rate:
+        waiting_rate.discard(
+            admin_id
+        )
+
+        cancelled = True
+
     await message.answer(
         (
             "✅ Действие отменено."
@@ -5820,6 +5911,89 @@ async def admin_message_router(
     ):
         return
 
+    # --------------------------------------------------------
+    # Курс RUB/THB — только менеджеру
+    # --------------------------------------------------------
+
+    if message.text == RATE_BTN_TEXT:
+        waiting_rate.add(
+            admin_id
+        )
+
+        await message.answer(
+            "Какой?"
+        )
+        return
+
+    if admin_id in waiting_rate:
+        if not message.text:
+            await message.answer(
+                "Введите курс числом. Например: 2.71"
+            )
+            return
+
+        raw_rate = (
+            message.text
+            .strip()
+            .replace(",", ".")
+        )
+
+        try:
+            rate = float(raw_rate)
+        except ValueError:
+            await message.answer(
+                "Введите курс числом. Например: 2.71"
+            )
+            return
+
+        if (
+            not math.isfinite(rate)
+            or rate < 0.1
+            or rate > 100
+        ):
+            await message.answer(
+                "Введите корректный курс. Например: 2.71"
+            )
+            return
+
+        try:
+            result = await save_rub_rate(
+                rate,
+                admin_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "RUB RATE SAVE ERROR"
+            )
+
+            await message.answer(
+                (
+                    "⚠️ Не удалось сохранить курс.\n"
+                    f"Ошибка: {exc}"
+                )
+            )
+            return
+
+        waiting_rate.discard(
+            admin_id
+        )
+
+        saved_rate = float(
+            result.get("rate", rate)
+        )
+
+        await message.answer(
+            (
+                "✅ Курс сохранён.\n"
+                f"1 ฿ = {saved_rate:.2f} ₽\n\n"
+                f"Пример: 200 ฿ = {round(200 * saved_rate)} ₽"
+            ),
+            reply_markup=start_keyboard(
+                message.from_user
+            ),
+        )
+        return
+
     # Менеджер присылает: SM-877 https://tracking-link...
     if message.text:
         tracking_match = re.fullmatch(r"\s*(SM-[0-9]+)\s+(https?://\S+)\s*", message.text, flags=re.I)
@@ -6220,6 +6394,7 @@ async def ensure_keyboard_if_missing(
     if message.text in (
         ASK_BTN_TEXT,
         MENU_BTN_TEXT,
+        RATE_BTN_TEXT,
     ):
         return
 
