@@ -1,0 +1,6 @@
+Final local checks (2026-09-08):
+- python3 -m py_compile bot.py: OK
+- Existing Mini App handlers preserved
+- New HTTP endpoints: /health, /website-order, /mealpoint/subscription, /mealpoint/receipt
+- Prep table defaults all menu dishes to 5 minutes; +10 kitchen buffer
+- Google Routes TWO_WHEELER uses cafe origin 7.910335,98.368771; +10 delivery buffer
