@@ -1,0 +1,30 @@
+ОСНОВНОЙ TGFOODBOT — НЕ ПУТАТЬ СО SCREENCOOK
+
+Это основной пользовательский бот Smoke Factory BBQ. Старый polling, Mini App, пользователи,
+бонусы, история, менеджер и WEB_APP_DATA сохранены. Новые функции добавлены поверх.
+
+Railway Variables:
+TELEGRAM_BOT_TOKEN=<ТОКЕН ОСНОВНОГО БОТА>
+DATABASE_URL=<СТАРАЯ БД SmokeFactory/MiniApp>
+ADMIN_CHAT_ID=<telegram id менеджера>
+WEBAPP_URL=<URL Mini App>
+PRINT_URL=<URL чековой программы>
+
+Новые интеграции:
+WEBSITE_ORDER_SECRET=<общий секрет с smokefactorybbq.com>
+MEALPOINT_BOT_SECRET=<общий секрет с meal-point.com>
+SCREEN_SERVICE_URL=https://screegrab-production.up.railway.app
+SCREEN_SERVICE_SECRET=<необязательно, если SCREEN_REQUIRE_SECRET не включен в Screencook>
+GOOGLE_MAPS_API_KEY=<server key Routes + Geocoding>
+OPENAI_API_KEY=<для AI ответов клиентам>
+OPENAI_MODEL=<необязательно>
+CAFE_LATITUDE=7.910335
+CAFE_LONGITUDE=98.368771
+
+HTTP:
+GET  /health
+POST /website-order
+POST /mealpoint/subscription
+POST /mealpoint/receipt
+
+ВАЖНО: BOT_TOKEN второго Screencook сюда НЕ копировать.
