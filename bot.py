@@ -531,6 +531,18 @@ async def init_database() -> None:
             ALTER TABLE orders
             ADD COLUMN IF NOT EXISTS loyalty_request_id TEXT;
 
+            /*
+             * Идентификатор конкретной попытки оформления заказа из Mini App.
+             * Нужен, чтобы один и тот же WebAppData не обрабатывался дважды:
+             * без повторного сообщения клиенту, без повторной печати и стикера.
+             */
+            ALTER TABLE orders
+            ADD COLUMN IF NOT EXISTS client_request_id TEXT;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_request
+            ON orders(telegram_id, client_request_id)
+            WHERE client_request_id IS NOT NULL;
+
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_order_number
             ON orders(order_number)
@@ -1450,7 +1462,7 @@ async def latest_pending_promptpay_order(telegram_id: int):
         SELECT id,order_number FROM orders
         WHERE telegram_id=$1
           AND lower(replace(replace(replace(COALESCE(payment_method,''),' ',''),'-',''),'_',''))
-              IN ('promptpay','promtpay','thaibank','thai','truemoney','truewallet')
+              IN ('promptpay','promtpay','thaibank','thai','truemoney','truewallet','банкрф','bankrf','russianbank')
           AND payment_receipt_received_at IS NULL
           AND COALESCE(status,'created') <> 'cancelled'
         ORDER BY created_at DESC LIMIT 1
@@ -1474,7 +1486,7 @@ async def payment_reminder_worker() -> None:
                   AND created_at >= NOW() - INTERVAL '2 hours'
                   AND COALESCE(status,'created') <> 'cancelled'
                   AND lower(replace(replace(replace(COALESCE(payment_method,''),' ',''),'-',''),'_',''))
-                      IN ('promptpay','promtpay','thaibank','thai','truemoney','truewallet')
+                      IN ('promptpay','promtpay','thaibank','thai','truemoney','truewallet','банкрф','bankrf','russianbank')
                 ORDER BY created_at ASC LIMIT 50
                 """
             )
@@ -1606,6 +1618,36 @@ async def save_rub_rate(
                 )
 
             return data
+
+
+async def load_rub_rate() -> float:
+    """Получает текущий курс RUB за 1 THB из Mini App."""
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(
+            f"{MINI_APP_API_URL}/api/exchange-rate",
+            headers={"Cache-Control": "no-cache"},
+        ) as response:
+            raw = await response.text()
+            try:
+                data = json.loads(raw or "{}")
+            except Exception:
+                data = {}
+
+            rate = float(data.get("rate") or 0)
+            if (
+                response.status != 200
+                or not data.get("ok")
+                or not math.isfinite(rate)
+                or rate <= 0
+            ):
+                raise RuntimeError(
+                    safe_str(data.get("error"), "").strip()
+                    or f"HTTP {response.status}: {raw[:300]}"
+                )
+
+            return rate
 
 
 def is_admin(
@@ -2254,9 +2296,13 @@ async def save_order_to_database(
     user: types.User,
     data: dict,
     order_items: list[dict],
-) -> tuple[int, str]:
+) -> tuple[int, str, bool]:
     """
     Сохраняет заказ и атомарно получает следующий номер SM-*.
+
+    Возвращает (order_id, order_number, is_new).
+    Если Telegram/Mini App по ошибке прислал тот же orderRequestId повторно,
+    новый заказ не создаётся: возвращается уже существующий заказ и is_new=False.
 
     SM-* — это внутренний номер заказа, а не номер кассового чека.
     Пропуски в номерах заказов допустимы. Нумерацию чеков ведёт
@@ -2359,6 +2405,12 @@ async def save_order_to_database(
         except Exception:
             order_date = None
 
+    client_request_id = safe_str(
+        data.get("orderRequestId")
+        or data.get("order_request_id"),
+        "",
+    ).strip()[:160] or None
+
     async with db_pool.acquire() as conn:
         async with conn.transaction():
             sequence_number = await conn.fetchval(
@@ -2373,7 +2425,7 @@ async def save_order_to_database(
                 f"SM-{int(sequence_number)}"
             )
 
-            order_id = await conn.fetchval(
+            row = await conn.fetchrow(
                 """
                 INSERT INTO orders (
                     order_number,
@@ -2391,14 +2443,18 @@ async def save_order_to_database(
                     order_when,
                     order_date,
                     order_time,
-                    comment
+                    comment,
+                    client_request_id
                 )
                 VALUES (
                     $1,$2,$3,$4,$5,$6,
                     $7,$8,$9,$10,$11,
-                    $12,$13,$14,$15,$16
+                    $12,$13,$14,$15,$16,$17
                 )
-                RETURNING id
+                ON CONFLICT (telegram_id, client_request_id)
+                WHERE client_request_id IS NOT NULL
+                DO NOTHING
+                RETURNING id, order_number
                 """,
                 order_number,
                 user.id,
@@ -2447,7 +2503,41 @@ async def save_order_to_database(
                         "note"
                     )
                 ),
+                client_request_id,
             )
+
+            if row is None:
+                if not client_request_id:
+                    raise RuntimeError(
+                        "Заказ не был сохранён"
+                    )
+
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id, order_number
+                    FROM orders
+                    WHERE telegram_id = $1
+                      AND client_request_id = $2
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    user.id,
+                    client_request_id,
+                )
+
+                if not existing:
+                    raise RuntimeError(
+                        "Не удалось найти уже сохранённый заказ"
+                    )
+
+                return (
+                    int(existing["id"]),
+                    safe_str(existing["order_number"]),
+                    False,
+                )
+
+            order_id = int(row["id"])
+            order_number = safe_str(row["order_number"])
 
             if order_items:
                 await conn.executemany(
@@ -2479,6 +2569,7 @@ async def save_order_to_database(
     return (
         int(order_id),
         order_number,
+        True,
     )
 
 
@@ -2740,70 +2831,45 @@ async def send_payload_to_receipt_program(
     timeout_seconds: int = 12,
 ) -> tuple[int, str]:
     """
-    Отправляет заказ в чековую программу.
-    При временной ошибке ngrok (502/503/504) или сети делает один повтор.
-    Повтор безопасен, потому что printer_gui.py не создаёт второй JSON
-    для уже принятого order_number.
+    Отправляет заказ в чековую программу ровно один раз.
+
+    Автоматический сетевой повтор намеренно отключён: локальная программа может
+    успеть принять/напечатать заказ, а ответ потеряться по сети. Повтор в такой
+    ситуации создаёт дубль. Если отправка не подтверждена, менеджер получает
+    предупреждение и может нажать ручную кнопку повторной отправки чека.
     """
     timeout = aiohttp.ClientTimeout(
         total=timeout_seconds
     )
 
-    last_error: Exception | None = None
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
+            async with session.post(
+                PRINT_URL,
+                json=print_payload,
+            ) as response:
+                response_text = await response.text()
 
-    async with aiohttp.ClientSession(
-        timeout=timeout
-    ) as session:
-        for attempt in range(2):
-            try:
-                async with session.post(
-                    PRINT_URL,
-                    json=print_payload,
-                ) as response:
-                    response_text = await response.text()
-
-                    if 200 <= response.status < 300:
-                        return (
-                            response.status,
-                            response_text,
-                        )
-
-                    error = RuntimeError(
-                        (
-                            f"Чековая программа вернула HTTP "
-                            f"{response.status}: "
-                            f"{response_text[:500]}"
-                        )
+                if 200 <= response.status < 300:
+                    return (
+                        response.status,
+                        response_text,
                     )
 
-                    if response.status in (502, 503, 504) and attempt == 0:
-                        last_error = error
-                        logger.warning(
-                            "PRINT HTTP %s. Повторная отправка через 1 секунду.",
-                            response.status,
-                        )
-                        await asyncio.sleep(1)
-                        continue
-
-                    raise error
-
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_error = exc
-
-                if attempt == 0:
-                    logger.warning(
-                        "PRINT network error: %s. Повторная отправка через 1 секунду.",
-                        safe_str(exc),
+                raise RuntimeError(
+                    (
+                        f"Чековая программа вернула HTTP "
+                        f"{response.status}: "
+                        f"{response_text[:500]}"
                     )
-                    await asyncio.sleep(1)
-                    continue
+                )
 
-                raise
-
-    if last_error is not None:
-        raise last_error
-
-    raise RuntimeError("Не удалось отправить заказ в чековую программу")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise RuntimeError(
+            f"Не удалось отправить заказ без безопасного повтора: {exc}"
+        ) from exc
 
 
 # ============================================================================
@@ -2842,7 +2908,13 @@ async def send_order_number_to_sticker_program(
     order_number: str,
     timeout_seconds: int = 7,
 ) -> tuple[int, str]:
-    """Старое поведение: отправляет только номер GF-* / SM-* на /grab."""
+    """
+    Отправляет только номер GF-* / SM-* на старый endpoint /grab.
+
+    ВАЖНО: автоматический повтор здесь намеренно отключён. /grab запускает
+    физическую печать стикера, поэтому повтор после timeout/502 может напечатать
+    второй такой же стикер, даже если первый запрос уже дошёл до принтера.
+    """
     number = safe_str(order_number, "").strip().upper()
     if not re.fullmatch(r"(?:GF|SM)-[0-9]+", number):
         raise ValueError(f"Некорректный номер для стикера: {number!r}")
@@ -2852,44 +2924,30 @@ async def send_order_number_to_sticker_program(
         raise RuntimeError("Не удалось определить адрес /grab для чековой программы")
 
     timeout = aiohttp.ClientTimeout(total=timeout_seconds)
-    last_error: Exception | None = None
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(2):
-            try:
-                async with session.post(
-                    endpoint,
-                    json={"order_number": number},
-                ) as response:
-                    response_text = await response.text()
-                    if 200 <= response.status < 300:
-                        logger.info(
-                            "STICKER /grab OK: order=%s HTTP=%s response=%s",
-                            number,
-                            response.status,
-                            response_text[:300],
-                        )
-                        return response.status, response_text
-
-                    error = RuntimeError(
-                        f"Стикер /grab HTTP {response.status}: {response_text[:500]}"
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                endpoint,
+                json={"order_number": number},
+            ) as response:
+                response_text = await response.text()
+                if 200 <= response.status < 300:
+                    logger.info(
+                        "STICKER /grab OK: order=%s HTTP=%s response=%s",
+                        number,
+                        response.status,
+                        response_text[:300],
                     )
-                    if response.status in (502, 503, 504) and attempt == 0:
-                        last_error = error
-                        await asyncio.sleep(1)
-                        continue
-                    raise error
+                    return response.status, response_text
 
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_error = exc
-                if attempt == 0:
-                    await asyncio.sleep(1)
-                    continue
-                raise
-
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("Не удалось отправить номер заказа на /grab")
+                raise RuntimeError(
+                    f"Стикер /grab HTTP {response.status}: {response_text[:500]}"
+                )
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        raise RuntimeError(
+            f"Не удалось отправить стикер без безопасного повтора: {exc}"
+        ) from exc
 
 
 # ============================================================================
@@ -5602,12 +5660,18 @@ async def handle_order(
         f"tg-{client_id}-{message.message_id}",
     )[:160]
 
+    # Сохраняем нормализованный request id обратно в data, чтобы защита от
+    # дублей работала и для старых клиентов Mini App без orderRequestId.
+    data["orderRequestId"] = order_request_id
+    data["order_request_id"] = order_request_id
+
     order_number = ""
 
     try:
         (
             saved_order_id,
             order_number,
+            is_new_order,
         ) = await save_order_to_database(
             user,
             data,
@@ -5617,6 +5681,15 @@ async def handle_order(
         data[
             "order_number"
         ] = order_number
+
+        if not is_new_order:
+            logger.warning(
+                "DUPLICATE WEBAPP ORDER IGNORED: request_id=%s order=%s user=%s",
+                order_request_id,
+                order_number,
+                client_id,
+            )
+            return
 
         logger.info(
             (
@@ -5738,6 +5811,40 @@ async def handle_order(
         return
 
     # --------------------------------------------------------
+    # ОПЛАТА БАНК РФ: ФИНАЛЬНЫЙ РАСЧЁТ В РУБЛЯХ
+    # --------------------------------------------------------
+    rub_rate = 0.0
+    rub_total = 0
+
+    if normalized_payment(pay_method) == "Банк РФ":
+        try:
+            # Берём курс с того же сервера, куда менеджер сохранил его кнопкой «Курс».
+            # Так сумма в боте считается сервером, а не доверяется браузеру клиента.
+            rub_rate = await load_rub_rate()
+        except Exception:
+            logger.exception("RUB RATE LOAD ERROR FOR ORDER %s", order_number)
+
+            # Резерв: используем курс, который Mini App только что применил при
+            # показе QR. Это не мешает принять заказ при кратком сетевом сбое.
+            try:
+                fallback_rate = float(
+                    data.get("rubRate")
+                    or data.get("rub_rate")
+                    or 0
+                )
+                if math.isfinite(fallback_rate) and 0.1 <= fallback_rate <= 100:
+                    rub_rate = fallback_rate
+            except Exception:
+                rub_rate = 0.0
+
+        if rub_rate > 0:
+            rub_total = int(round(total * rub_rate))
+            data["rubRate"] = rub_rate
+            data["rub_rate"] = rub_rate
+            data["rubTotal"] = rub_total
+            data["rub_total"] = rub_total
+
+    # --------------------------------------------------------
     # АВТОМАТИЧЕСКИЙ ETA + ЭКРАНЫ
     # --------------------------------------------------------
     try:
@@ -5766,6 +5873,12 @@ async def handle_order(
         f"Оплата: "
         f"{pay_method}\n"
     )
+
+    if rub_total > 0:
+        client_text += (
+            f"К оплате в рублях: {rub_total} ₽\n"
+            f"Курс: 1 ฿ = {rub_rate:.2f} ₽\n"
+        )
 
     if when_str:
         client_text += (
@@ -5854,6 +5967,12 @@ async def handle_order(
         f"• <i>Оплата:</i> "
         f"{html.escape(pay_method)}\n"
     )
+
+    if rub_total > 0:
+        admin_text += (
+            f"• <i>К оплате в рублях:</i> {rub_total} ₽\n"
+            f"• <i>Курс:</i> 1 ฿ = {rub_rate:.2f} ₽\n"
+        )
 
     if when_str:
         admin_text += (
@@ -5955,6 +6074,9 @@ async def handle_order(
         "delivery": delivery,
 
         "payment": pay_method,
+
+        "rub_rate": rub_rate if rub_rate > 0 else None,
+        "rub_total": rub_total if rub_total > 0 else None,
 
         "items": order_items,
 
@@ -6141,7 +6263,7 @@ async def handle_order(
 async def receive_payment_receipt(message: types.Message) -> None:
     row = await latest_pending_promptpay_order(message.from_user.id)
     if not row:
-        await message.answer("Файл получил. Сейчас у вас нет заказа PromptPay, ожидающего чек.")
+        await message.answer("Файл получил. Сейчас у вас нет заказа, ожидающего чек об оплате.")
         return
     file_id = None
     mime = "image/jpeg"
