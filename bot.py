@@ -4265,6 +4265,8 @@ async def cmd_admin_help(
 
             "/bonus — установить ручную накопленную сумму\n"
 
+            "SM-455 https://... — отправить клиенту ссылку отслеживания курьера\n"
+
             "/cancel — отменить текущее действие"
         )
     )
@@ -6446,22 +6448,87 @@ async def admin_message_router(
         )
         return
 
-    # Менеджер присылает: SM-877 https://tracking-link...
+    # --------------------------------------------------------
+    # Ссылка на отслеживание курьера
+    # Менеджер может прислать, например:
+    #   SM-455 https://tracking.example/abc
+    #   SM-455 (https://tracking.example/abc)
+    # --------------------------------------------------------
     if message.text:
-        tracking_match = re.fullmatch(r"\s*(SM-[0-9]+)\s+(https?://\S+)\s*", message.text, flags=re.I)
-        if tracking_match and db_pool:
+        tracking_match = re.fullmatch(
+            r"\s*(SM-[0-9]+)\s+(?:\(\s*)?(https?://[^\s)]+)(?:\s*\))?\s*",
+            message.text,
+            flags=re.I,
+        )
+
+        if tracking_match:
             order_no = tracking_match.group(1).upper()
             tracking_url = tracking_match.group(2)
+
+            if not db_pool:
+                await message.answer(
+                    "⚠️ База данных сейчас недоступна. Ссылка клиенту не отправлена."
+                )
+                return
+
             row = await db_pool.fetchrow(
-                "SELECT telegram_id FROM orders WHERE upper(order_number)=$1 ORDER BY created_at DESC LIMIT 1",
+                """
+                SELECT telegram_id
+                FROM orders
+                WHERE upper(order_number) = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
                 order_no,
             )
-            if row:
-                await db_pool.execute("UPDATE orders SET tracking_url=$2 WHERE upper(order_number)=$1", order_no, tracking_url)
-                await bot.send_message(int(row["telegram_id"]), f"🛵 Курьер выехал. Следить за доставкой:\n{tracking_url}")
-                await message.answer(f"✅ Ссылка отправлена клиенту заказа {order_no}.")
-            else:
-                await message.answer(f"⚠️ Заказ {order_no} не найден.")
+
+            if not row or not row["telegram_id"]:
+                await message.answer(f"⚠️ Заказ {order_no} не найден или у него нет Telegram-клиента.")
+                return
+
+            client_id = int(row["telegram_id"])
+
+            try:
+                await bot.send_message(
+                    client_id,
+                    (
+                        "🛵 Курьер выехал, можете отслеживать его "
+                        "передвижение по ссылке:\n"
+                        f"{tracking_url}"
+                    ),
+                )
+
+                await db_pool.execute(
+                    """
+                    UPDATE orders
+                    SET tracking_url = $2
+                    WHERE upper(order_number) = $1
+                    """,
+                    order_no,
+                    tracking_url,
+                )
+
+                await mark_send_success(client_id, "courier_tracking")
+
+                await message.answer(
+                    f"✅ Ссылка на курьера отправлена клиенту заказа {order_no}."
+                )
+
+            except Exception as exc:
+                blocked = is_blocking_error(exc)
+                await mark_send_error(client_id, str(exc), blocked)
+                logger.exception(
+                    "Не удалось отправить ссылку курьера клиенту %s по заказу %s",
+                    client_id,
+                    order_no,
+                )
+                await message.answer(
+                    (
+                        f"⚠️ Не удалось отправить ссылку клиенту заказа {order_no}. "
+                        "Клиент мог заблокировать бота."
+                    )
+                )
+
             return
 
     # Ответ на вопрос, переданный AI менеджеру.
