@@ -138,6 +138,8 @@ GRAB_RECEIVER_URL = NGROK_PRINTER_BASE_URL
 
 WEBSITE_ORDER_SECRET = os.getenv("WEBSITE_ORDER_SECRET", "").strip()
 MEALPOINT_BOT_SECRET = os.getenv("MEALPOINT_BOT_SECRET", "").strip()
+MEALPOINT_SITE_URL = os.getenv("MEALPOINT_SITE_URL", "https://www.meal-point.com").strip().rstrip("/")
+PICKUP_MONITOR_POINT = os.getenv("PICKUP_MONITOR_POINT", "chalong").strip().lower() or "chalong"
 SCREEN_SERVICE_URL = os.getenv("SCREEN_SERVICE_URL", "https://screegrab-production.up.railway.app").strip().rstrip("/")
 SCREEN_SERVICE_SECRET = os.getenv("SCREEN_SERVICE_SECRET", "").strip()
 GOOGLE_MAPS_API_KEY = (os.getenv("GOOGLE_ROUTES_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("NEXT_PUBLIC_GOOGLE_MAPS_API_KEY") or "").strip()
@@ -219,6 +221,17 @@ PICKUP_ALERT_DEDUP_SECONDS = int(
 )
 
 pickup_alert_recent: dict[str, float] = {}
+
+# Last heartbeat received from MealPoint pickup infrastructure.
+# This monitor is isolated from orders, mini-app and customer message flows.
+PICKUP_OFFLINE_AFTER_SECONDS = int(
+    os.getenv(
+        "PICKUP_OFFLINE_AFTER_SECONDS",
+        "420",
+    )
+)
+pickup_last_heartbeat: dict[str, float] = {}
+pickup_offline_alerted: set[str] = set()
 
 
 TIMEZONE = ZoneInfo(
@@ -7211,6 +7224,21 @@ async def http_mealpoint_pickup_event(request: web.Request) -> web.Response:
             status=400,
         )
 
+    if event == "heartbeat":
+        now = time.monotonic()
+        was_offline = point in pickup_offline_alerted
+        pickup_last_heartbeat[point] = now
+        if was_offline:
+            pickup_offline_alerted.discard(point)
+            try:
+                await bot.send_message(
+                    ADMIN_CHAT_ID,
+                    f"✅ MealPoint — {point.upper()}\n\nСвязь с ESP32 восстановлена.",
+                )
+            except Exception:
+                logger.exception("MealPoint pickup online notification failed: point=%s", point)
+        return web.json_response({"ok": True, "heartbeat": True, "restored": was_offline})
+
     dedupe_key, text = build_pickup_event_message(data)
     now = time.monotonic()
     previous = pickup_alert_recent.get(dedupe_key)
@@ -7231,6 +7259,70 @@ async def http_mealpoint_pickup_event(request: web.Request) -> web.Response:
     pickup_alert_recent[dedupe_key] = now
     logger.info("MealPoint pickup event sent: point=%s event=%s", point, event)
     return web.json_response({"ok": True})
+
+
+async def pickup_offline_monitor_worker() -> None:
+    """Check MealPoint server state and notify once if ESP32 stops polling it."""
+    if not MEALPOINT_BOT_SECRET:
+        logger.warning(
+            "Pickup monitor disabled: MEALPOINT_BOT_SECRET is not configured"
+        )
+        return
+
+    point = PICKUP_MONITOR_POINT
+    url = f"{MEALPOINT_SITE_URL}/api/pickup-lock/monitor?point={point}"
+
+    while True:
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url,
+                    headers={"X-MealPoint-Secret": MEALPOINT_BOT_SECRET},
+                ) as response:
+                    if response.status != 200:
+                        logger.warning(
+                            "Pickup monitor HTTP %s: %s",
+                            response.status,
+                            await response.text(),
+                        )
+                    else:
+                        data = await response.json()
+                        seconds = data.get("secondsSinceLastSeen")
+                        try:
+                            seconds = int(seconds) if seconds is not None else None
+                        except (TypeError, ValueError):
+                            seconds = None
+
+                        is_offline = (
+                            seconds is not None
+                            and seconds >= PICKUP_OFFLINE_AFTER_SECONDS
+                        )
+
+                        if is_offline and point not in pickup_offline_alerted:
+                            pickup_offline_alerted.add(point)
+                            last_seen = safe_str(data.get("lastSeenAt"), "—")
+                            await bot.send_message(
+                                ADMIN_CHAT_ID,
+                                (
+                                    f"🔴 MealPoint — {point.upper()}\n\n"
+                                    "Нет связи с ESP32 пункта выдачи.\n"
+                                    f"Последний сигнал: {last_seen}\n"
+                                    f"Связь отсутствует более {PICKUP_OFFLINE_AFTER_SECONDS // 60} минут."
+                                ),
+                            )
+                        elif not is_offline and seconds is not None and point in pickup_offline_alerted:
+                            pickup_offline_alerted.discard(point)
+                            await bot.send_message(
+                                ADMIN_CHAT_ID,
+                                f"✅ MealPoint — {point.upper()}\n\nСвязь с ESP32 восстановлена.",
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MealPoint pickup offline monitor error")
+
+        await asyncio.sleep(60)
 
 
 async def start_http_server() -> web.AppRunner:
@@ -7279,6 +7371,7 @@ async def main() -> None:
 
     http_runner = await start_http_server()
     reminder_task = asyncio.create_task(payment_reminder_worker())
+    pickup_monitor_task = asyncio.create_task(pickup_offline_monitor_worker())
 
     schedule_restart()
 
@@ -7293,8 +7386,13 @@ async def main() -> None:
 
     finally:
         reminder_task.cancel()
+        pickup_monitor_task.cancel()
         try:
             await reminder_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await pickup_monitor_task
         except asyncio.CancelledError:
             pass
         await http_runner.cleanup()
