@@ -6926,6 +6926,85 @@ async def admin_message_router(
 
         return
 
+    # --------------------------------------------------------
+    # Фото клиенту по номеру заказа
+    # Менеджер отправляет фото с подписью, например: SM-544
+    # --------------------------------------------------------
+    if message.photo and message.caption:
+        photo_order_match = re.fullmatch(
+            r"\s*(SM-[0-9]+)\s*",
+            message.caption,
+            flags=re.I,
+        )
+
+        if photo_order_match:
+            order_no = photo_order_match.group(1).upper()
+
+            if not db_pool:
+                await message.answer(
+                    "⚠️ База данных сейчас недоступна. Фото клиенту не отправлено."
+                )
+                return
+
+            row = await db_pool.fetchrow(
+                """
+                SELECT telegram_id
+                FROM orders
+                WHERE upper(order_number) = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                order_no,
+            )
+
+            if not row or not row["telegram_id"]:
+                await message.answer(
+                    f"⚠️ Заказ {order_no} не найден или у него нет Telegram-клиента."
+                )
+                return
+
+            client_id = int(row["telegram_id"])
+            photo_file_id = message.photo[-1].file_id
+
+            try:
+                await bot.send_photo(
+                    client_id,
+                    photo_file_id,
+                )
+
+                await mark_send_success(
+                    client_id,
+                    "order_photo",
+                )
+
+                await message.answer(
+                    f"✅ Фото отправлено клиенту заказа {order_no}."
+                )
+
+            except Exception as exc:
+                blocked = is_blocking_error(exc)
+
+                await mark_send_error(
+                    client_id,
+                    str(exc),
+                    blocked,
+                )
+
+                logger.exception(
+                    "Не удалось отправить фото клиенту %s по заказу %s",
+                    client_id,
+                    order_no,
+                )
+
+                await message.answer(
+                    (
+                        f"⚠️ Не удалось отправить фото клиенту заказа {order_no}. "
+                        "Клиент мог заблокировать бота."
+                    )
+                )
+
+            return
+
 
 # ============================================================================
 # ОБЫЧНЫЕ СООБЩЕНИЯ
