@@ -6972,6 +6972,11 @@ async def admin_message_router(
                     photo_file_id,
                 )
 
+                await bot.send_message(
+                    client_id,
+                    "Ваш заказ доставлен. Приятного аппетита.",
+                )
+
                 await mark_send_success(
                     client_id,
                     "order_photo",
